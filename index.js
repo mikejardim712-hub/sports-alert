@@ -1,80 +1,45 @@
 // ============================================================
-//  COMMERCIAL BREAK DETECTOR — Fixed Version
+//  COMMERCIAL BREAK DETECTOR — Baseball Edition
+//  Uses inning + outs to detect between-half-inning breaks
 // ============================================================
 
 const NTFY_TOPIC = process.env.NTFY_TOPIC || process.env.NTFY_TOPIC;
-const COMMERCIAL_THRESHOLD_SECONDS = 120;
-const POLL_INTERVAL_MS = 30_000;
+const POLL_INTERVAL_MS = 20_000; // 20 seconds — pitches happen fast
 
 // ---- TEAM NAME MAP -----------------------------------------
-// Maps common nicknames to ESPN's full team name (lowercase)
 const TEAM_ALIASES = {
-  // MLB
-  "marlins":    "miami marlins",
-  "blue jays":  "toronto blue jays",
-  "bluejays":   "toronto blue jays",
-  "nationals":  "washington nationals",
-  "guardians":  "cleveland guardians",
-  "yankees":    "new york yankees",
-  "red sox":    "boston red sox",
-  "dodgers":    "los angeles dodgers",
-  "cubs":       "chicago cubs",
-  "mets":       "new york mets",
-  "braves":     "atlanta braves",
-  "astros":     "houston astros",
-  "phillies":   "philadelphia phillies",
-  "cardinals":  "st. louis cardinals",
-  "giants":     "san francisco giants",
-  "padres":     "san diego padres",
-  "brewers":    "milwaukee brewers",
-  "pirates":    "pittsburgh pirates",
-  "reds":       "cincinnati reds",
-  "rockies":    "colorado rockies",
+  "marlins":      "miami marlins",
+  "blue jays":    "toronto blue jays",
+  "bluejays":     "toronto blue jays",
+  "nationals":    "washington nationals",
+  "guardians":    "cleveland guardians",
+  "yankees":      "new york yankees",
+  "red sox":      "boston red sox",
+  "dodgers":      "los angeles dodgers",
+  "cubs":         "chicago cubs",
+  "mets":         "new york mets",
+  "braves":       "atlanta braves",
+  "astros":       "houston astros",
+  "phillies":     "philadelphia phillies",
+  "cardinals":    "st. louis cardinals",
+  "giants":       "san francisco giants",
+  "padres":       "san diego padres",
+  "brewers":      "milwaukee brewers",
+  "pirates":      "pittsburgh pirates",
+  "reds":         "cincinnati reds",
+  "rockies":      "colorado rockies",
   "diamondbacks": "arizona diamondbacks",
-  "angels":     "los angeles angels",
-  "athletics":  "oakland athletics",
-  "mariners":   "seattle mariners",
-  "rangers":    "texas rangers",
-  "twins":      "minnesota twins",
-  "tigers":     "detroit tigers",
-  "royals":     "kansas city royals",
-  "white sox":  "chicago white sox",
-  "orioles":    "baltimore orioles",
-  "rays":       "tampa bay rays",
-  // NBA
-  "celtics":    "boston celtics",
-  "lakers":     "los angeles lakers",
-  "warriors":   "golden state warriors",
-  "heat":       "miami heat",
-  "bucks":      "milwaukee bucks",
-  "knicks":     "new york knicks",
-  "nets":       "brooklyn nets",
-  // NFL
-  "patriots":   "new england patriots",
-  "eagles":     "philadelphia eagles",
-  "chiefs":     "kansas city chiefs",
-  "cowboys":    "dallas cowboys",
-  "49ers":      "san francisco 49ers",
-  // NHL
-  "bruins":     "boston bruins",
-  "rangers":    "new york rangers",
-  "penguins":   "pittsburgh penguins",
+  "angels":       "los angeles angels",
+  "athletics":    "oakland athletics",
+  "mariners":     "seattle mariners",
+  "rangers":      "texas rangers",
+  "twins":        "minnesota twins",
+  "tigers":       "detroit tigers",
+  "royals":       "kansas city royals",
+  "white sox":    "chicago white sox",
+  "orioles":      "baltimore orioles",
+  "rays":         "tampa bay rays",
 };
-
-// ---- SPORT DETECTION ---------------------------------------
-function detectSport(nickname) {
-  const n = nickname.toLowerCase();
-  const mlbTeams = ["marlins","blue jays","nationals","guardians","yankees","red sox","dodgers","cubs","mets","braves","astros","phillies","cardinals","giants","padres","brewers","pirates","reds","rockies","diamondbacks","angels","athletics","mariners","rangers","twins","tigers","royals","white sox","orioles","rays"];
-  const nbaTeams = ["celtics","lakers","warriors","heat","bucks","knicks","nets"];
-  const nflTeams = ["patriots","eagles","chiefs","cowboys","49ers"];
-  const nhlTeams = ["bruins","rangers","penguins","blackhawks"];
-
-  if (mlbTeams.some(t => n.includes(t))) return "baseball/mlb";
-  if (nbaTeams.some(t => n.includes(t))) return "basketball/nba";
-  if (nflTeams.some(t => n.includes(t))) return "football/nfl";
-  if (nhlTeams.some(t => n.includes(t))) return "hockey/nhl";
-  return "baseball/mlb";
-}
 
 // ---- ESPN API ----------------------------------------------
 async function fetchLiveGames(sport) {
@@ -90,64 +55,60 @@ function findMatchingEvent(events, nickname) {
   const nick = nickname.toLowerCase().replace(" game", "").trim();
   const fullName = TEAM_ALIASES[nick] || nick;
 
-  console.log(`[${nickname}] Searching for: "${fullName}" among ${events.length} games`);
+  console.log(`[${nickname}] Looking for: "${fullName}" among ${events.length} games`);
 
   for (const event of events) {
     const eventName = (event.name || "").toLowerCase();
     const shortName = (event.shortName || "").toLowerCase();
+    console.log(`  → ESPN has: ${event.name} (${event.status?.type?.description})`);
 
-    // Log every game found so we can debug
-    console.log(`  → Found game: ${event.name} | status: ${event.status?.type?.description}`);
+    if (eventName.includes(fullName) || shortName.includes(fullName)) return event;
 
-    if (eventName.includes(fullName) || shortName.includes(fullName)) {
-      return event;
-    }
-
-    // Also try matching just the city or team nickname word by word
     const words = fullName.split(" ");
-    const lastWord = words[words.length - 1]; // e.g. "marlins" from "miami marlins"
-    if (lastWord.length > 4 && (eventName.includes(lastWord) || shortName.includes(lastWord))) {
-      return event;
-    }
+    const lastWord = words[words.length - 1];
+    if (lastWord.length > 4 && (eventName.includes(lastWord) || shortName.includes(lastWord))) return event;
   }
-
   return null;
 }
 
-// ---- CLOCK EXTRACTION --------------------------------------
-function extractClockInfo(event) {
+// ---- BASEBALL SITUATION EXTRACTION -------------------------
+function extractBaseballSituation(event) {
   const competition = event?.competitions?.[0];
   const status = competition?.status;
   if (!status) return null;
 
   const state = status?.type?.state;
-  const description = status?.type?.description || "";
+  if (state !== "in") {
+    console.log(`  → Not in progress (state: "${state}")`);
+    return null;
+  }
 
-  console.log(`  → State: "${state}", Description: "${description}", Clock: "${status.displayClock}", Period: ${status.period}`);
+  const situation = competition?.situation;
+  const inning = status?.period || 1;
+  const outs = situation?.outs ?? null;
+  const detail = status?.type?.shortDetail || "";
+  const isTop = detail.toLowerCase().includes("top");
+  const isBot = detail.toLowerCase().includes("bot");
+  const halfInning = isTop ? "top" : isBot ? "bottom" : "top";
 
-  // Only track if in progress
-  if (state !== "in") return null;
+  console.log(`  → ${halfInning} ${inning}, Outs: ${outs}, Detail: "${detail}"`);
 
-  return {
-    clock: status.displayClock || "0:00",
-    period: status.period || 1,
-    description,
-  };
+  return { inning, halfInning, outs, detail };
 }
 
 // ---- STATE & NOTIFICATION ----------------------------------
 const gameState = {};
 
-async function sendNotification(message) {
-  console.log(`[NOTIFY] ${message}`);
+async function sendNotification(title, message) {
+  console.log(`[NOTIFY] ${title} — ${message}`);
   try {
     await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
       method: "POST",
       body: message,
       headers: {
-        "Title": "⚾ Game is back live!",
+        "Title": title,
         "Priority": "high",
-        "Tags": "sports,tv",
+        "Tags": "sports,baseball",
       },
     });
   } catch (err) {
@@ -155,54 +116,69 @@ async function sendNotification(message) {
   }
 }
 
-function checkClock(gameId, nickname, clockInfo) {
-  const now = new Date();
+function ordinal(n) {
+  if (n === 1) return "1st";
+  if (n === 2) return "2nd";
+  if (n === 3) return "3rd";
+  return `${n}th`;
+}
+
+function checkBaseballSituation(gameId, nickname, sit) {
   const state = gameState[gameId];
 
   if (!state) {
     gameState[gameId] = {
-      lastClockValue: clockInfo.clock,
-      lastClockChangedAt: now,
+      lastInning: sit.inning,
+      lastHalfInning: sit.halfInning,
+      lastOuts: sit.outs,
       isOnCommercial: false,
     };
-    console.log(`[${nickname}] ✅ Now tracking! Clock: ${clockInfo.clock}, Period: ${clockInfo.period}`);
+    console.log(`[${nickname}] ✅ Tracking started — ${sit.halfInning} ${ordinal(sit.inning)}, ${sit.outs} outs`);
     return;
   }
 
-  const clockChanged = clockInfo.clock !== state.lastClockValue;
+  const halfInningChanged =
+    sit.inning !== state.lastInning || sit.halfInning !== state.lastHalfInning;
 
-  if (clockChanged) {
-    const wasOnCommercial = state.isOnCommercial;
-    state.lastClockValue = clockInfo.clock;
-    state.lastClockChangedAt = now;
+  // Between half-innings: outs will be null or 3
+  const isBreak = sit.outs === null || sit.outs >= 3;
+
+  // Back live: half-inning just flipped and outs reset to 0 or 1
+  const backLive = halfInningChanged && (sit.outs === 0 || sit.outs === 1);
+
+  if (backLive && state.isOnCommercial) {
+    const half = sit.halfInning === "top" ? "Top" : "Bottom";
+    sendNotification(
+      "⚾ Game is back live!",
+      `${nickname} is back! ${half} of the ${ordinal(sit.inning)} is starting.`
+    );
+    console.log(`[${nickname}] ✅ BACK LIVE — ${sit.halfInning} ${ordinal(sit.inning)}`);
     state.isOnCommercial = false;
-
-    if (wasOnCommercial) {
-      sendNotification(`${nickname} is back from commercial! Period ${clockInfo.period}, clock: ${clockInfo.clock}`);
-      console.log(`[${nickname}] ✅ BACK LIVE`);
-    } else {
-      console.log(`[${nickname}] Live — Clock: ${clockInfo.clock}, Period: ${clockInfo.period}`);
-    }
+  } else if (isBreak && !state.isOnCommercial) {
+    console.log(`[${nickname}] 📺 Commercial break — between half-innings`);
+    state.isOnCommercial = true;
+  } else if (!isBreak) {
+    console.log(`[${nickname}] ▶ Live — ${sit.halfInning} ${ordinal(sit.inning)}, ${sit.outs} out(s)`);
+    state.isOnCommercial = false;
   } else {
-    const frozenSec = Math.floor((now - state.lastClockChangedAt) / 1000);
-    if (frozenSec >= COMMERCIAL_THRESHOLD_SECONDS && !state.isOnCommercial) {
-      state.isOnCommercial = true;
-      console.log(`[${nickname}] 📺 Commercial detected (frozen ${frozenSec}s)`);
-    } else {
-      console.log(`[${nickname}] Clock frozen ${frozenSec}s / ${COMMERCIAL_THRESHOLD_SECONDS}s threshold`);
-    }
+    console.log(`[${nickname}] 📺 Still on commercial...`);
   }
+
+  state.lastInning = sit.inning;
+  state.lastHalfInning = sit.halfInning;
+  state.lastOuts = sit.outs;
 }
 
 // ---- GAMES TO WATCH ----------------------------------------
+// Change these to whatever games you're watching!
 const GAMES_TO_WATCH = [
-  { nickname: "Phillies game",   sport: "baseball/mlb", espnGameId: null },
-  { nickname: "Nationals game", sport: "baseball/mlb", espnGameId: null },
+  { nickname: "Phillies game", sport: "baseball/mlb", espnGameId: null },
+  { nickname: "Rays game",   sport: "baseball/mlb", espnGameId: null },
 ];
 
 // ---- MAIN POLL ---------------------------------------------
 async function poll() {
-  console.log("\n--- Poll at", new Date().toLocaleTimeString(), "---");
+  console.log("\n--- Poll:", new Date().toLocaleTimeString(), "---");
 
   for (const game of GAMES_TO_WATCH) {
     try {
@@ -212,27 +188,27 @@ async function poll() {
         const event = findMatchingEvent(events, game.nickname);
         if (event) {
           game.espnGameId = event.id;
-          console.log(`[${game.nickname}] Game ID locked: ${event.id}`);
+          console.log(`[${game.nickname}] 🔒 Locked: ${event.name}`);
         } else {
-          console.log(`[${game.nickname}] Not found yet — game may not have started.`);
+          console.log(`[${game.nickname}] Not found yet.`);
           continue;
         }
       }
 
       const event = events.find(e => e.id === game.espnGameId);
       if (!event) {
-        console.log(`[${game.nickname}] Game ended or dropped from scoreboard.`);
+        console.log(`[${game.nickname}] Game ended or dropped.`);
         game.espnGameId = null;
         continue;
       }
 
-      const clockInfo = extractClockInfo(event);
-      if (!clockInfo) {
-        console.log(`[${game.nickname}] Game not currently in progress.`);
+      const sit = extractBaseballSituation(event);
+      if (!sit) {
+        console.log(`[${game.nickname}] Not currently in progress.`);
         continue;
       }
 
-      checkClock(game.espnGameId, game.nickname, clockInfo);
+      checkBaseballSituation(game.espnGameId, game.nickname, sit);
 
     } catch (err) {
       console.error(`[${game.nickname}] Error:`, err.message);
@@ -241,12 +217,12 @@ async function poll() {
 }
 
 // ---- START -------------------------------------------------
-console.log("===========================================");
-console.log("  Commercial Break Detector — v2 (Fixed)");
-console.log("===========================================");
+console.log("============================================");
+console.log("  Commercial Break Detector — Baseball v3");
+console.log("============================================");
 console.log(`Watching: ${GAMES_TO_WATCH.map(g => g.nickname).join(", ")}`);
 console.log(`Notifications → ntfy.sh/${NTFY_TOPIC}`);
-console.log("-------------------------------------------");
+console.log("--------------------------------------------");
 
 poll();
 setInterval(poll, POLL_INTERVAL_MS);
