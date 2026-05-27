@@ -1,67 +1,142 @@
 // ============================================================
-//  COMMERCIAL BREAK DETECTOR
-//  Paste this into Glitch.com or Replit and run it.
-//  It watches up to 2 games and sends you a notification
-//  when a game comes back from commercial break.
+//  COMMERCIAL BREAK DETECTOR — Fixed Version
 // ============================================================
 
-// ---- CONFIGURATION (edit these) ----------------------------
-
-const GAMES_TO_WATCH = [
-  { nickname: "Marlins game", espnGameId: null },  // espnGameId filled in automatically (see below)
-  { nickname: "Nationals game",  espnGameId: null },
-];
-
-// Ntfy.sh topic — go to ntfy.sh, pick any unique topic name (like "johns-sports-alert-7742")
-// Install the free ntfy app on your phone and subscribe to the same topic name.
-const NTFY_TOPIC = process.env.NTFY_TOPIC;
-
-// How many seconds the clock must be frozen before we call it a commercial break
-const COMMERCIAL_THRESHOLD_SECONDS = 120; // 2 minutes
-
-// How often to poll ESPN (in milliseconds). 30 seconds is plenty.
+const NTFY_TOPIC = process.env.NTFY_TOPIC || process.env.NTFY_TOPIC;
+const COMMERCIAL_THRESHOLD_SECONDS = 120;
 const POLL_INTERVAL_MS = 30_000;
 
-// ---- STATE (don't edit) ------------------------------------
+// ---- TEAM NAME MAP -----------------------------------------
+// Maps common nicknames to ESPN's full team name (lowercase)
+const TEAM_ALIASES = {
+  // MLB
+  "marlins":    "miami marlins",
+  "blue jays":  "toronto blue jays",
+  "bluejays":   "toronto blue jays",
+  "nationals":  "washington nationals",
+  "guardians":  "cleveland guardians",
+  "yankees":    "new york yankees",
+  "red sox":    "boston red sox",
+  "dodgers":    "los angeles dodgers",
+  "cubs":       "chicago cubs",
+  "mets":       "new york mets",
+  "braves":     "atlanta braves",
+  "astros":     "houston astros",
+  "phillies":   "philadelphia phillies",
+  "cardinals":  "st. louis cardinals",
+  "giants":     "san francisco giants",
+  "padres":     "san diego padres",
+  "brewers":    "milwaukee brewers",
+  "pirates":    "pittsburgh pirates",
+  "reds":       "cincinnati reds",
+  "rockies":    "colorado rockies",
+  "diamondbacks": "arizona diamondbacks",
+  "angels":     "los angeles angels",
+  "athletics":  "oakland athletics",
+  "mariners":   "seattle mariners",
+  "rangers":    "texas rangers",
+  "twins":      "minnesota twins",
+  "tigers":     "detroit tigers",
+  "royals":     "kansas city royals",
+  "white sox":  "chicago white sox",
+  "orioles":    "baltimore orioles",
+  "rays":       "tampa bay rays",
+  // NBA
+  "celtics":    "boston celtics",
+  "lakers":     "los angeles lakers",
+  "warriors":   "golden state warriors",
+  "heat":       "miami heat",
+  "bucks":      "milwaukee bucks",
+  "knicks":     "new york knicks",
+  "nets":       "brooklyn nets",
+  // NFL
+  "patriots":   "new england patriots",
+  "eagles":     "philadelphia eagles",
+  "chiefs":     "kansas city chiefs",
+  "cowboys":    "dallas cowboys",
+  "49ers":      "san francisco 49ers",
+  // NHL
+  "bruins":     "boston bruins",
+  "rangers":    "new york rangers",
+  "penguins":   "pittsburgh penguins",
+};
 
-const gameState = {};
-// gameState[gameId] = {
-//   lastClockValue: "12:34",
-//   lastClockChangedAt: Date,
-//   isOnCommercial: false,
-//   notifiedReturn: false,
-// }
+// ---- SPORT DETECTION ---------------------------------------
+function detectSport(nickname) {
+  const n = nickname.toLowerCase();
+  const mlbTeams = ["marlins","blue jays","nationals","guardians","yankees","red sox","dodgers","cubs","mets","braves","astros","phillies","cardinals","giants","padres","brewers","pirates","reds","rockies","diamondbacks","angels","athletics","mariners","rangers","twins","tigers","royals","white sox","orioles","rays"];
+  const nbaTeams = ["celtics","lakers","warriors","heat","bucks","knicks","nets"];
+  const nflTeams = ["patriots","eagles","chiefs","cowboys","49ers"];
+  const nhlTeams = ["bruins","rangers","penguins","blackhawks"];
+
+  if (mlbTeams.some(t => n.includes(t))) return "baseball/mlb";
+  if (nbaTeams.some(t => n.includes(t))) return "basketball/nba";
+  if (nflTeams.some(t => n.includes(t))) return "football/nfl";
+  if (nhlTeams.some(t => n.includes(t))) return "hockey/nhl";
+  return "baseball/mlb";
+}
 
 // ---- ESPN API ----------------------------------------------
-
-// Fetches all live/recent games for a given sport.
-// sport options: "basketball/nba", "football/nfl", "baseball/mlb", "hockey/nhl", "basketball/wnba"
 async function fetchLiveGames(sport) {
   const url = `https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard`;
   const res = await fetch(url);
+  if (!res.ok) throw new Error(`ESPN API error: ${res.status}`);
   const json = await res.json();
   return json.events || [];
 }
 
-// Returns the current game clock and period for a specific game event.
-// Returns null if the game isn't live.
+// ---- GAME MATCHING -----------------------------------------
+function findMatchingEvent(events, nickname) {
+  const nick = nickname.toLowerCase().replace(" game", "").trim();
+  const fullName = TEAM_ALIASES[nick] || nick;
+
+  console.log(`[${nickname}] Searching for: "${fullName}" among ${events.length} games`);
+
+  for (const event of events) {
+    const eventName = (event.name || "").toLowerCase();
+    const shortName = (event.shortName || "").toLowerCase();
+
+    // Log every game found so we can debug
+    console.log(`  → Found game: ${event.name} | status: ${event.status?.type?.description}`);
+
+    if (eventName.includes(fullName) || shortName.includes(fullName)) {
+      return event;
+    }
+
+    // Also try matching just the city or team nickname word by word
+    const words = fullName.split(" ");
+    const lastWord = words[words.length - 1]; // e.g. "marlins" from "miami marlins"
+    if (lastWord.length > 4 && (eventName.includes(lastWord) || shortName.includes(lastWord))) {
+      return event;
+    }
+  }
+
+  return null;
+}
+
+// ---- CLOCK EXTRACTION --------------------------------------
 function extractClockInfo(event) {
-  const status = event?.status;
+  const competition = event?.competitions?.[0];
+  const status = competition?.status;
   if (!status) return null;
 
-  const type = status.type;
+  const state = status?.type?.state;
+  const description = status?.type?.description || "";
 
-  // Not in progress
-  if (type?.state !== "in") return null;
+  console.log(`  → State: "${state}", Description: "${description}", Clock: "${status.displayClock}", Period: ${status.period}`);
+
+  // Only track if in progress
+  if (state !== "in") return null;
 
   return {
-    clock: status.displayClock,   // e.g. "4:32" or "0:00"
-    period: status.period,         // e.g. 3 (3rd quarter)
-    description: type?.description // e.g. "In Progress"
+    clock: status.displayClock || "0:00",
+    period: status.period || 1,
+    description,
   };
 }
 
-// ---- NOTIFICATION ------------------------------------------
+// ---- STATE & NOTIFICATION ----------------------------------
+const gameState = {};
 
 async function sendNotification(message) {
   console.log(`[NOTIFY] ${message}`);
@@ -70,147 +145,108 @@ async function sendNotification(message) {
       method: "POST",
       body: message,
       headers: {
-        "Title": "🏀 Game is back live!",
+        "Title": "⚾ Game is back live!",
         "Priority": "high",
-        "Tags": "sports,tv"
-      }
+        "Tags": "sports,tv",
+      },
     });
   } catch (err) {
-    console.error("Failed to send notification:", err.message);
+    console.error("Notification failed:", err.message);
   }
 }
 
-// ---- CORE LOGIC --------------------------------------------
-
-function checkForCommercialBreak(gameId, nickname, clockInfo) {
+function checkClock(gameId, nickname, clockInfo) {
   const now = new Date();
   const state = gameState[gameId];
 
-  // First time seeing this game
   if (!state) {
     gameState[gameId] = {
       lastClockValue: clockInfo.clock,
       lastClockChangedAt: now,
       isOnCommercial: false,
     };
-    console.log(`[${nickname}] Tracking started. Clock: ${clockInfo.clock}, Period: ${clockInfo.period}`);
+    console.log(`[${nickname}] ✅ Now tracking! Clock: ${clockInfo.clock}, Period: ${clockInfo.period}`);
     return;
   }
 
   const clockChanged = clockInfo.clock !== state.lastClockValue;
 
   if (clockChanged) {
-    // Clock is moving — game is live
     const wasOnCommercial = state.isOnCommercial;
-
     state.lastClockValue = clockInfo.clock;
     state.lastClockChangedAt = now;
     state.isOnCommercial = false;
 
     if (wasOnCommercial) {
-      // It was on commercial and just came back!
-      const message = `${nickname} is back from commercial! (${clockInfo.period === 1 ? "1st" : clockInfo.period === 2 ? "2nd" : clockInfo.period === 3 ? "3rd" : clockInfo.period + "th"} period, ${clockInfo.clock} left)`;
-      console.log(`[${nickname}] ✅ BACK LIVE — ${clockInfo.clock}`);
-      sendNotification(message);
+      sendNotification(`${nickname} is back from commercial! Period ${clockInfo.period}, clock: ${clockInfo.clock}`);
+      console.log(`[${nickname}] ✅ BACK LIVE`);
     } else {
-      console.log(`[${nickname}] Live. Clock: ${clockInfo.clock}, Period: ${clockInfo.period}`);
+      console.log(`[${nickname}] Live — Clock: ${clockInfo.clock}, Period: ${clockInfo.period}`);
     }
   } else {
-    // Clock hasn't moved — check how long it's been frozen
-    const frozenMs = now - state.lastClockChangedAt;
-    const frozenSec = Math.floor(frozenMs / 1000);
-
+    const frozenSec = Math.floor((now - state.lastClockChangedAt) / 1000);
     if (frozenSec >= COMMERCIAL_THRESHOLD_SECONDS && !state.isOnCommercial) {
       state.isOnCommercial = true;
-      console.log(`[${nickname}] 📺 On commercial (frozen ${frozenSec}s)`);
+      console.log(`[${nickname}] 📺 Commercial detected (frozen ${frozenSec}s)`);
     } else {
-      console.log(`[${nickname}] Clock frozen for ${frozenSec}s... (threshold: ${COMMERCIAL_THRESHOLD_SECONDS}s)`);
+      console.log(`[${nickname}] Clock frozen ${frozenSec}s / ${COMMERCIAL_THRESHOLD_SECONDS}s threshold`);
     }
   }
 }
 
-// ---- MAIN LOOP ---------------------------------------------
+// ---- GAMES TO WATCH ----------------------------------------
+const GAMES_TO_WATCH = [
+  { nickname: "Phillies game",   sport: "baseball/mlb", espnGameId: null },
+  { nickname: "Nationals game", sport: "baseball/mlb", espnGameId: null },
+];
 
-// Detects which sport a nickname likely refers to (simple keyword match)
-function detectSport(nickname) {
-  const n = nickname.toLowerCase();
-  if (n.includes("celtics") || n.includes("lakers") || n.includes("nba") || n.includes("warriors") || n.includes("heat") || n.includes("bucks") || n.includes("knicks") || n.includes("nets")) return "basketball/nba";
-  if (n.includes("patriots") || n.includes("eagles") || n.includes("nfl") || n.includes("chiefs") || n.includes("cowboys") || n.includes("giants") || n.includes("49ers")) return "football/nfl";
-  if (n.includes("yankees") || n.includes("red sox") || n.includes("mlb") || n.includes("dodgers") || n.includes("cubs")) return "baseball/mlb";
-  if (n.includes("bruins") || n.includes("rangers") || n.includes("nhl") || n.includes("penguins") || n.includes("blackhawks")) return "hockey/nhl";
-  return "basketball/nba"; // default
-}
-
-// Finds the ESPN game ID by matching the team name in the nickname
-async function findGameId(gameConfig) {
-  if (gameConfig.espnGameId) return gameConfig.espnGameId; // already set
-
-  const sport = detectSport(gameConfig.nickname);
-  const events = await fetchLiveGames(sport);
-
-  for (const event of events) {
-    const name = event.name?.toLowerCase() || "";
-    const shortName = event.shortName?.toLowerCase() || "";
-    const nick = gameConfig.nickname.toLowerCase();
-
-    // Check if any word in the nickname matches the game name
-    const words = nick.replace(" game", "").trim().split(" ");
-    const matches = words.some(w => w.length > 3 && (name.includes(w) || shortName.includes(w)));
-
-    if (matches) {
-      console.log(`[${gameConfig.nickname}] Found game: ${event.name} (ID: ${event.id})`);
-      return event.id;
-    }
-  }
-
-  console.log(`[${gameConfig.nickname}] No live game found right now.`);
-  return null;
-}
-
+// ---- MAIN POLL ---------------------------------------------
 async function poll() {
+  console.log("\n--- Poll at", new Date().toLocaleTimeString(), "---");
+
   for (const game of GAMES_TO_WATCH) {
     try {
-      // Auto-find the game ID if not set
+      const events = await fetchLiveGames(game.sport);
+
       if (!game.espnGameId) {
-        game.espnGameId = await findGameId(game);
+        const event = findMatchingEvent(events, game.nickname);
+        if (event) {
+          game.espnGameId = event.id;
+          console.log(`[${game.nickname}] Game ID locked: ${event.id}`);
+        } else {
+          console.log(`[${game.nickname}] Not found yet — game may not have started.`);
+          continue;
+        }
       }
-      if (!game.espnGameId) continue;
 
-      // Fetch current scoreboard and find this game
-      const sport = detectSport(game.nickname);
-      const events = await fetchLiveGames(sport);
       const event = events.find(e => e.id === game.espnGameId);
-
       if (!event) {
-        console.log(`[${game.nickname}] Game not found in scoreboard (may have ended).`);
-        game.espnGameId = null; // reset so it re-searches next poll
+        console.log(`[${game.nickname}] Game ended or dropped from scoreboard.`);
+        game.espnGameId = null;
         continue;
       }
 
       const clockInfo = extractClockInfo(event);
       if (!clockInfo) {
-        console.log(`[${game.nickname}] Game not currently live.`);
+        console.log(`[${game.nickname}] Game not currently in progress.`);
         continue;
       }
 
-      checkForCommercialBreak(game.espnGameId, game.nickname, clockInfo);
+      checkClock(game.espnGameId, game.nickname, clockInfo);
 
     } catch (err) {
-      console.error(`[${game.nickname}] Error during poll:`, err.message);
+      console.error(`[${game.nickname}] Error:`, err.message);
     }
   }
 }
 
-// ---- STARTUP -----------------------------------------------
-
+// ---- START -------------------------------------------------
 console.log("===========================================");
-console.log("  Commercial Break Detector — Starting up");
+console.log("  Commercial Break Detector — v2 (Fixed)");
 console.log("===========================================");
 console.log(`Watching: ${GAMES_TO_WATCH.map(g => g.nickname).join(", ")}`);
-console.log(`Notifications: ntfy.sh/${NTFY_TOPIC}`);
-console.log(`Polling every ${POLL_INTERVAL_MS / 1000}s`);
+console.log(`Notifications → ntfy.sh/${NTFY_TOPIC}`);
 console.log("-------------------------------------------");
 
-// Run immediately, then on an interval
 poll();
 setInterval(poll, POLL_INTERVAL_MS);
