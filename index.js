@@ -294,14 +294,14 @@ async function sendNotification(title, message) {
       method: "POST",
       body: message,
       headers: {
-        "Title": title,
+        "Title": title.replace(/[^\x00-\x7F]/g, "").trim(),
         "Priority": "high",
         "Tags": "sports,tv",
       },
     });
-    console.log("  ✅ Notification sent successfully");
+    console.log("  Notification sent successfully");
   } catch (err) {
-    console.error("  ❌ Notification failed:", err.message);
+    console.error("  Notification failed:", err.message);
   }
 }
 
