@@ -74,7 +74,7 @@ function detectSport(n) {
 }
 
 async function fetchGames(sport) {
-  const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard`);
+  const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard?limit=100`);
   if (!r.ok) throw new Error(`ESPN ${r.status}`);
   return (await r.json()).events || [];
 }
