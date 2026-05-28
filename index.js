@@ -245,11 +245,21 @@ async function pollAll() {
         const event = events.find(e => e.id === game.espnId);
         if (!event) { game.status = "final"; game._sit = null; game.espnId = null; continue; }
 
-        const sit = getSituation(event, game.sport);
-        if (!sit) { game.status = "not started"; game._sit = null; continue; }
+        // Log the raw status so we can see what ESPN is sending
+        const comp = event?.competitions?.[0];
+        const status = comp?.status;
+        const sit = comp?.situation;
+        console.log(`[${game.nickname}] state=${status?.type?.state} detail="${status?.type?.shortDetail}" outs=${sit?.outs ?? "none"} period=${status?.period}`);
 
-        game._sit = sit;
-        game.detail = sit.label;
+        const situation = getSituation(event, game.sport);
+        if (!situation) {
+          game.status = "not started";
+          game._sit = null;
+          continue;
+        }
+
+        game._sit = situation;
+        game.detail = situation.label;
         processGame(session, game);
 
       } catch(e) {
