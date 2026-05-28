@@ -2,9 +2,9 @@
 //  BACKLIVE SERVER v7 — Fixed MLB "End" detection
 // ============================================================
  
-body: JSON.stringify({ ntfyTopic: topic, games, key: "Lola" })
 const http = require("http");
 const PORT = process.env.PORT || 3000;
+const SECRET_KEY = process.env.SECRET_KEY || "Lola";
 const POLL_MS = 25000;
  
 const TEAM_ALIASES = {
@@ -287,11 +287,10 @@ async function pollAll() {
  
         const event = events.find(e => e.id === game.espnId);
         if (!event) {
-  game.status = "final"; game._sit = null; game.espnId = null;
-  notify(session.ntfyTopic, "Game over!", `${game.fullName || game.nickname} is final.`);
-  console.log(`[${game.nickname}] Game ended`);
-  continue;
-}
+          game.status = "final"; game._sit = null; game.espnId = null;
+          console.log(`[${game.nickname}] Game ended`);
+          continue;
+        }
  
         const comp = event?.competitions?.[0];
         const status = comp?.status;
@@ -343,7 +342,7 @@ http.createServer(async (req, res) => {
  
   if (req.method === "POST" && url.pathname === "/start") {
     const { ntfyTopic, games, key } = await readBody(req);
-    if (key !== SECRET_KEY) { jsonRes(res, 401, { error: "Unauthorized" }); return; }
+if (key !== SECRET_KEY) { jsonRes(res, 401, { error: "Unauthorized" }); return; }
     if (!ntfyTopic || !games?.length) { jsonRes(res, 400, { error: "Missing ntfyTopic or games" }); return; }
     sessions[ntfyTopic] = {
       ntfyTopic,
