@@ -5,6 +5,7 @@
 const http = require("http");
 const PORT = process.env.PORT || 3000;
 const POLL_MS = 25000;
+const SECRET_KEY = process.env.SECRET_KEY || "Lola";
  
 const TEAM_ALIASES = {
   "angels":"los angeles angels","astros":"houston astros","athletics":"oakland athletics",
@@ -341,7 +342,8 @@ http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") { jsonRes(res, 200, {}); return; }
  
   if (req.method === "POST" && url.pathname === "/start") {
-    const { ntfyTopic, games } = await readBody(req);
+    const { ntfyTopic, games, key } = await readBody(req);
+    if (key !== SECRET_KEY) { jsonRes(res, 401, { error: "Unauthorized" }); return; }
     if (!ntfyTopic || !games?.length) { jsonRes(res, 400, { error: "Missing ntfyTopic or games" }); return; }
     sessions[ntfyTopic] = {
       ntfyTopic,
