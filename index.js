@@ -286,10 +286,11 @@ async function pollAll() {
  
         const event = events.find(e => e.id === game.espnId);
         if (!event) {
-          game.status = "final"; game._sit = null; game.espnId = null;
-          console.log(`[${game.nickname}] Game ended`);
-          continue;
-        }
+  game.status = "final"; game._sit = null; game.espnId = null;
+  notify(session.ntfyTopic, "Game over!", `${game.fullName || game.nickname} is final.`);
+  console.log(`[${game.nickname}] Game ended`);
+  continue;
+}
  
         const comp = event?.competitions?.[0];
         const status = comp?.status;
