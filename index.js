@@ -2,10 +2,10 @@
 //  BACKLIVE SERVER v7 — Fixed MLB "End" detection
 // ============================================================
  
+body: JSON.stringify({ ntfyTopic: topic, games, key: "Lola" })
 const http = require("http");
 const PORT = process.env.PORT || 3000;
 const POLL_MS = 25000;
-const SECRET_KEY = process.env.SECRET_KEY || "Lola";
  
 const TEAM_ALIASES = {
   "angels":"los angeles angels","astros":"houston astros","athletics":"oakland athletics",
