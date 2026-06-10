@@ -1,13 +1,21 @@
 // ============================================================
-//  BACKLIVE SERVER v7 — Fixed MLB "End" detection
+//  BACKLIVE SERVER v9 — Spotify + World Cup / Soccer
 // ============================================================
- 
+
 const http = require("http");
 const PORT = process.env.PORT || 3000;
-const SECRET_KEY = process.env.SECRET_KEY || "Lola";
 const POLL_MS = 25000;
- 
+
+const SECRET_KEY = process.env.SECRET_KEY || "Lola";
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || "b9f103fdac944282ba3f56a03c866606";
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || "3007ce1e51a74d08ad91800025b0ce6d";
+const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || "https://backlive.netlify.app/callback";
+
+// ============================================================
+//  TEAM ALIASES
+// ============================================================
 const TEAM_ALIASES = {
+  // MLB
   "angels":"los angeles angels","astros":"houston astros","athletics":"oakland athletics",
   "blue jays":"toronto blue jays","bluejays":"toronto blue jays","braves":"atlanta braves",
   "brewers":"milwaukee brewers","cardinals":"st. louis cardinals","cubs":"chicago cubs",
@@ -20,6 +28,7 @@ const TEAM_ALIASES = {
   "rockies":"colorado rockies","royals":"kansas city royals","tigers":"detroit tigers",
   "twins":"minnesota twins","white sox":"chicago white sox","whitesox":"chicago white sox",
   "yankees":"new york yankees",
+  // NBA
   "76ers":"philadelphia 76ers","sixers":"philadelphia 76ers","bucks":"milwaukee bucks",
   "bulls":"chicago bulls","cavaliers":"cleveland cavaliers","cavs":"cleveland cavaliers",
   "celtics":"boston celtics","clippers":"los angeles clippers","grizzlies":"memphis grizzlies",
@@ -32,6 +41,7 @@ const TEAM_ALIASES = {
   "thunder":"oklahoma city thunder","timberwolves":"minnesota timberwolves","wolves":"minnesota timberwolves",
   "trail blazers":"portland trail blazers","blazers":"portland trail blazers",
   "warriors":"golden state warriors","wizards":"washington wizards",
+  // NFL
   "49ers":"san francisco 49ers","bears":"chicago bears","bengals":"cincinnati bengals",
   "bills":"buffalo bills","broncos":"denver broncos","browns":"cleveland browns",
   "buccaneers":"tampa bay buccaneers","bucs":"tampa bay buccaneers","cardinals":"arizona cardinals",
@@ -44,6 +54,7 @@ const TEAM_ALIASES = {
   "ravens":"baltimore ravens","saints":"new orleans saints","seahawks":"seattle seahawks",
   "steelers":"pittsburgh steelers","texans":"houston texans","titans":"tennessee titans",
   "vikings":"minnesota vikings","new york giants":"new york giants",
+  // NHL
   "avalanche":"colorado avalanche","avs":"colorado avalanche","blackhawks":"chicago blackhawks",
   "blue jackets":"columbus blue jackets","blues":"st. louis blues","bruins":"boston bruins",
   "canadiens":"montreal canadiens","habs":"montreal canadiens","canucks":"vancouver canucks",
@@ -58,28 +69,51 @@ const TEAM_ALIASES = {
   "senators":"ottawa senators","sens":"ottawa senators","sharks":"san jose sharks",
   "stars":"dallas stars","wild":"minnesota wild","winnipeg jets":"winnipeg jets",
   "florida panthers":"florida panthers","new york rangers":"new york rangers",
+  // World Cup / Soccer — all 48 teams
+  "usa":"united states","united states":"united states","usmnt":"united states",
+  "mexico":"mexico","canada":"canada","argentina":"argentina","brazil":"brazil",
+  "france":"france","england":"england","spain":"spain","portugal":"portugal",
+  "germany":"germany","netherlands":"netherlands","holland":"netherlands",
+  "belgium":"belgium","croatia":"croatia","uruguay":"uruguay","switzerland":"switzerland",
+  "denmark":"denmark","japan":"japan","south korea":"south korea","korea":"south korea",
+  "morocco":"morocco","senegal":"senegal","australia":"australia","poland":"poland",
+  "serbia":"serbia","ecuador":"ecuador","cameroon":"cameroon","ghana":"ghana",
+  "tunisia":"tunisia","iran":"iran","saudi arabia":"saudi arabia","qatar":"qatar",
+  "costa rica":"costa rica","panama":"panama","wales":"wales","albania":"albania",
+  "slovenia":"slovenia","slovakia":"slovakia","georgia":"georgia","turkey":"turkey",
+  "colombia":"colombia","venezuela":"venezuela","bolivia":"bolivia","chile":"chile",
+  "peru":"peru","paraguay":"paraguay","honduras":"honduras","uzbekistan":"uzbekistan",
+  "jordan":"jordan","cabo verde":"cabo verde","curacao":"curacao","austria":"austria",
+  "ukraine":"ukraine","nigeria":"nigeria","egypt":"egypt","ivory coast":"ivory coast",
+  "mali":"mali","south africa":"south africa","new zealand":"new zealand",
+  "jamaica":"jamaica","guatemala":"guatemala","el salvador":"el salvador",
 };
- 
+
 const MLB = ["angels","astros","athletics","blue jays","braves","brewers","cardinals","cubs","diamondbacks","dbacks","dodgers","giants","guardians","mariners","marlins","mets","nationals","orioles","padres","phillies","pirates","rangers","rays","red sox","reds","rockies","royals","tigers","twins","white sox","yankees"];
 const NBA = ["76ers","sixers","bucks","bulls","cavaliers","cavs","celtics","clippers","grizzlies","hawks","heat","hornets","jazz","kings","knicks","lakers","magic","mavericks","mavs","nets","nuggets","pacers","pelicans","pistons","raptors","rockets","spurs","suns","thunder","timberwolves","wolves","trail blazers","blazers","warriors","wizards"];
 const NFL = ["49ers","bears","bengals","bills","broncos","browns","buccaneers","bucs","chargers","chiefs","colts","commanders","cowboys","dolphins","eagles","falcons","giants","jaguars","jets","lions","packers","panthers","patriots","pats","raiders","rams","ravens","saints","seahawks","steelers","texans","titans","vikings"];
 const NHL = ["avalanche","avs","blackhawks","blue jackets","blues","bruins","canadiens","habs","canucks","capitals","caps","coyotes","devils","ducks","flames","flyers","golden knights","knights","hurricanes","canes","islanders","kraken","lightning","bolts","maple leafs","leafs","oilers","penguins","pens","predators","preds","red wings","sabres","senators","sens","sharks","stars","wild","winnipeg jets","florida panthers","new york rangers"];
- 
+const SOCCER = ["usa","united states","usmnt","mexico","canada","argentina","brazil","france","england","spain","portugal","germany","netherlands","holland","belgium","croatia","uruguay","switzerland","denmark","japan","south korea","korea","morocco","senegal","australia","poland","serbia","ecuador","cameroon","ghana","tunisia","iran","saudi arabia","qatar","costa rica","panama","wales","albania","slovenia","slovakia","georgia","turkey","colombia","venezuela","bolivia","chile","peru","paraguay","honduras","uzbekistan","jordan","cabo verde","curacao","austria","ukraine","nigeria","egypt","ivory coast","mali","south africa","new zealand","jamaica","guatemala","el salvador"];
+
 function detectSport(n) {
   n = n.toLowerCase();
   if (MLB.some(t => n.includes(t))) return "baseball/mlb";
   if (NBA.some(t => n.includes(t))) return "basketball/nba";
   if (NFL.some(t => n.includes(t))) return "football/nfl";
   if (NHL.some(t => n.includes(t))) return "hockey/nhl";
+  if (SOCCER.some(t => n.includes(t))) return "soccer/fifa.world";
   return "baseball/mlb";
 }
- 
+
+// ============================================================
+//  ESPN API
+// ============================================================
 async function fetchGames(sport) {
   const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard?limit=100`);
   if (!r.ok) throw new Error(`ESPN ${r.status}`);
   return (await r.json()).events || [];
 }
- 
+
 function findEvent(events, nickname) {
   const nick = nickname.toLowerCase().replace(/ game$/, "").trim();
   const full = TEAM_ALIASES[nick] || nick;
@@ -92,19 +126,19 @@ function findEvent(events, nickname) {
   }
   return null;
 }
- 
+
 function ord(n) {
   return n === 1 ? "1st" : n === 2 ? "2nd" : n === 3 ? "3rd" : `${n}th`;
 }
- 
+
 // ============================================================
-//  SITUATION EXTRACTOR
+//  SITUATION EXTRACTORS
 // ============================================================
 function getSituation(event, sport) {
   const comp = event?.competitions?.[0];
   const status = comp?.status;
   if (!status || status?.type?.state !== "in") return null;
- 
+
   if (sport === "baseball/mlb") {
     const sit = comp?.situation;
     const inning = status?.period || 1;
@@ -113,24 +147,22 @@ function getSituation(event, sport) {
     const detailLower = detail.toLowerCase();
     const isEnd = detailLower.includes("end");
     const half = detailLower.includes("bot") ? "bottom" : "top";
-    const label = isEnd
-      ? `End of ${ord(inning)}`
-      : `${half === "top" ? "Top" : "Bot"} ${ord(inning)}, ${outs ?? 0} outs`;
+    const label = isEnd ? `End of ${ord(inning)}` : `${half === "top" ? "Top" : "Bot"} ${ord(inning)}, ${outs ?? 0} outs`;
     return { sport: "mlb", inning, half, outs, isEnd, detail, label };
   }
- 
+
   if (sport === "basketball/nba") {
     const clock = status.displayClock || "0:00";
     const period = status.period || 1;
     return { sport: "nba", clock, period, label: `${ord(period)} qtr, ${clock}` };
   }
- 
+
   if (sport === "football/nfl") {
     const clock = status.displayClock || "0:00";
     const period = status.period || 1;
     return { sport: "nfl", clock, period, label: `${ord(period)} qtr, ${clock}` };
   }
- 
+
   if (sport === "hockey/nhl") {
     const period = status.period || 1;
     const clock = status.displayClock || "0:00";
@@ -138,35 +170,99 @@ function getSituation(event, sport) {
     const intermission = detail.includes("end") || detail.includes("intermission") || clock === "0:00";
     return { sport: "nhl", period, clock, intermission, label: `Period ${period}, ${clock}` };
   }
- 
+
+  if (sport === "soccer/fifa.world") {
+    const clock = status.displayClock || "0:00";
+    const period = status.period || 1;
+    const detail = status?.type?.shortDetail || "";
+    const detailLower = detail.toLowerCase();
+    // Halftime = commercial break. Extra time periods also tracked.
+    const isHalftime = detailLower.includes("ht") || detailLower.includes("half time") || detailLower.includes("halftime") || period === 2 && clock === "0:00";
+    const half = period <= 1 ? "1st Half" : period === 2 ? "2nd Half" : `Extra Time ${period - 2}`;
+    const label = isHalftime ? "Halftime" : `${half}, ${clock}`;
+    return { sport: "soccer", period, clock, isHalftime, detail, label };
+  }
+
   return null;
 }
- 
+
 // ============================================================
 //  NOTIFICATIONS
 // ============================================================
 async function notify(topic, title, body) {
   try {
     await fetch(`https://ntfy.sh/${topic}`, {
-      method: "POST",
-      body,
+      method: "POST", body,
       headers: {
         "Title": title.replace(/[^\x00-\x7F]/g, "").trim(),
-        "Priority": "high",
-        "Tags": "sports,tv"
+        "Priority": "high", "Tags": "sports,tv"
       }
     });
     console.log(`[ntfy:${topic}] ${title}`);
-  } catch (e) {
-    console.error("ntfy fail:", e.message);
-  }
+  } catch (e) { console.error("ntfy fail:", e.message); }
 }
- 
+
+// ============================================================
+//  SPOTIFY
+// ============================================================
+const spotifyTokens = {};
+
+async function refreshSpotifyToken(ntfyTopic) {
+  const tokens = spotifyTokens[ntfyTopic];
+  if (!tokens?.refreshToken) return null;
+  try {
+    const r = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": "Basic " + Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64")
+      },
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refreshToken })
+    });
+    const data = await r.json();
+    if (data.access_token) {
+      tokens.accessToken = data.access_token;
+      tokens.expiresAt = Date.now() + (data.expires_in * 1000);
+      return data.access_token;
+    }
+  } catch (e) { console.error("Spotify refresh error:", e.message); }
+  return null;
+}
+
+async function getSpotifyToken(ntfyTopic) {
+  const tokens = spotifyTokens[ntfyTopic];
+  if (!tokens) return null;
+  if (Date.now() > (tokens.expiresAt - 60000)) return await refreshSpotifyToken(ntfyTopic);
+  return tokens.accessToken;
+}
+
+async function spotifyPause(ntfyTopic) {
+  const token = await getSpotifyToken(ntfyTopic);
+  if (!token) return;
+  try {
+    await fetch("https://api.spotify.com/v1/me/player/pause", {
+      method: "PUT", headers: { "Authorization": `Bearer ${token}` }
+    });
+    console.log(`[spotify:${ntfyTopic}] Paused`);
+  } catch (e) { console.error("Spotify pause error:", e.message); }
+}
+
+async function spotifyResume(ntfyTopic) {
+  const token = await getSpotifyToken(ntfyTopic);
+  if (!token) return;
+  try {
+    await fetch("https://api.spotify.com/v1/me/player/play", {
+      method: "PUT", headers: { "Authorization": `Bearer ${token}` }
+    });
+    console.log(`[spotify:${ntfyTopic}] Resumed`);
+  } catch (e) { console.error("Spotify resume error:", e.message); }
+}
+
 // ============================================================
 //  SESSION STORE
 // ============================================================
 const sessions = {};
- 
+
 function processGame(session, game) {
   const { ntfyTopic } = session;
   const key = game.nickname;
@@ -174,26 +270,25 @@ function processGame(session, game) {
   const state = session.states[key];
   const sit = game._sit;
   if (!sit) return;
- 
-  // ---- BASEBALL: uses "End Xth" detail as commercial signal ----
+
+  const wasOnCommercial = state.onCommercial;
+
+  // ---- MLB ----
   if (sit.sport === "mlb") {
     if (!state.initialized) {
       state.initialized = true;
       state.lastDetail = sit.detail;
       state.onCommercial = sit.isEnd;
-      console.log(`[${key}] Tracking started — ${sit.detail}, commercial=${sit.isEnd}`);
+      console.log(`[${key}] Tracking started — ${sit.detail}`);
       return;
     }
- 
     const detailChanged = sit.detail !== state.lastDetail;
     if (detailChanged) {
       console.log(`[${key}] "${state.lastDetail}" -> "${sit.detail}"`);
       if (sit.isEnd && !state.onCommercial) {
-        // Inning just ended — commercial break
         state.onCommercial = true;
         console.log(`[${key}] Commercial started`);
       } else if (!sit.isEnd && state.onCommercial) {
-        // New half inning — game is back!
         const half = sit.half === "top" ? "Top" : "Bottom";
         notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${half} of the ${ord(sit.inning)} starting.`);
         state.onCommercial = false;
@@ -204,8 +299,8 @@ function processGame(session, game) {
       console.log(`[${key}] ${sit.label} — ${state.onCommercial ? "commercial" : "live"}`);
     }
   }
- 
-  // ---- NBA / NFL: frozen clock detection ----
+
+  // ---- NBA / NFL ----
   else if (sit.sport === "nba" || sit.sport === "nfl") {
     const threshold = sit.sport === "nba" ? 120000 : 90000;
     const now = Date.now();
@@ -239,14 +334,14 @@ function processGame(session, game) {
       }
     }
   }
- 
-  // ---- NHL: between periods ----
+
+  // ---- NHL ----
   else if (sit.sport === "nhl") {
     if (!state.initialized) {
       state.initialized = true;
       state.lastPeriod = sit.period;
       state.onCommercial = sit.intermission;
-      console.log(`[${key}] Tracking started — Period ${sit.period}, intermission=${sit.intermission}`);
+      console.log(`[${key}] Tracking started — Period ${sit.period}`);
       return;
     }
     const periodChanged = sit.period !== state.lastPeriod;
@@ -263,10 +358,48 @@ function processGame(session, game) {
     }
     state.lastPeriod = sit.period;
   }
- 
+
+  // ---- SOCCER / WORLD CUP ----
+  else if (sit.sport === "soccer") {
+    if (!state.initialized) {
+      state.initialized = true;
+      state.lastDetail = sit.detail;
+      state.lastPeriod = sit.period;
+      state.onCommercial = sit.isHalftime;
+      console.log(`[${key}] Tracking started — ${sit.label}`);
+      return;
+    }
+    const detailChanged = sit.detail !== state.lastDetail;
+    const periodChanged = sit.period !== state.lastPeriod;
+    if (detailChanged || periodChanged) {
+      console.log(`[${key}] "${state.lastDetail}" -> "${sit.detail}"`);
+      if (sit.isHalftime && !state.onCommercial) {
+        state.onCommercial = true;
+        console.log(`[${key}] Halftime — commercial`);
+      } else if (!sit.isHalftime && state.onCommercial) {
+        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — 2nd half starting!`);
+        state.onCommercial = false;
+        console.log(`[${key}] BACK LIVE — 2nd half`);
+      }
+      state.lastDetail = sit.detail;
+      state.lastPeriod = sit.period;
+    } else {
+      console.log(`[${key}] ${sit.label} — ${state.onCommercial ? "halftime" : "live"}`);
+    }
+  }
+
   game.status = state.onCommercial ? "commercial" : "live";
+
+  // ---- SPOTIFY: resume on commercial, pause when back live ----
+  if (session.spotifyEnabled) {
+    if (!wasOnCommercial && state.onCommercial) {
+      spotifyResume(ntfyTopic);
+    } else if (wasOnCommercial && !state.onCommercial) {
+      spotifyPause(ntfyTopic);
+    }
+  }
 }
- 
+
 // ============================================================
 //  MAIN POLL
 // ============================================================
@@ -276,7 +409,7 @@ async function pollAll() {
       try {
         if (!game.sport) game.sport = detectSport(game.nickname);
         const events = await fetchGames(game.sport);
- 
+
         if (!game.espnId) {
           const event = findEvent(events, game.nickname);
           if (!event) { game.status = "not started"; game._sit = null; continue; }
@@ -284,26 +417,27 @@ async function pollAll() {
           game.fullName = event.name;
           console.log(`[${id}] Locked: ${event.name}`);
         }
- 
+
         const event = events.find(e => e.id === game.espnId);
         if (!event) {
           game.status = "final"; game._sit = null; game.espnId = null;
+          notify(session.ntfyTopic, "Game over!", `${game.fullName || game.nickname} is final.`);
           console.log(`[${game.nickname}] Game ended`);
           continue;
         }
- 
+
         const comp = event?.competitions?.[0];
         const status = comp?.status;
         const rawSit = comp?.situation;
-        console.log(`[${game.nickname}] state=${status?.type?.state} detail="${status?.type?.shortDetail}" outs=${rawSit?.outs ?? "none"}`);
- 
+        console.log(`[${game.nickname}] state=${status?.type?.state} detail="${status?.type?.shortDetail}" outs=${rawSit?.outs ?? "n/a"}`);
+
         const sit = getSituation(event, game.sport);
         if (!sit) { game.status = "not started"; game._sit = null; continue; }
- 
+
         game._sit = sit;
         game.detail = sit.label;
         processGame(session, game);
- 
+
       } catch (e) {
         console.error(`[${id}/${game.nickname}]`, e.message);
         game.status = "error";
@@ -311,10 +445,10 @@ async function pollAll() {
     }
   }
 }
- 
+
 setInterval(pollAll, POLL_MS);
 pollAll();
- 
+
 // ============================================================
 //  HTTP SERVER
 // ============================================================
@@ -327,7 +461,7 @@ function jsonRes(res, code, data) {
   });
   res.end(JSON.stringify(data));
 }
- 
+
 function readBody(req) {
   return new Promise(res => {
     let d = "";
@@ -335,44 +469,97 @@ function readBody(req) {
     req.on("end", () => { try { res(JSON.parse(d)); } catch { res({}); } });
   });
 }
- 
+
 http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   if (req.method === "OPTIONS") { jsonRes(res, 200, {}); return; }
- 
+
   if (req.method === "POST" && url.pathname === "/start") {
-    const { ntfyTopic, games, key } = await readBody(req);
-if (key !== SECRET_KEY) { jsonRes(res, 401, { error: "Unauthorized" }); return; }
+    const body = await readBody(req);
+    const { ntfyTopic, games, key } = body;
+    if (key !== SECRET_KEY) { jsonRes(res, 401, { error: "Unauthorized" }); return; }
     if (!ntfyTopic || !games?.length) { jsonRes(res, 400, { error: "Missing ntfyTopic or games" }); return; }
     sessions[ntfyTopic] = {
       ntfyTopic,
       games: games.map(n => ({ nickname: n, espnId: null, sport: null, status: "searching", detail: "", fullName: "", _sit: null })),
-      states: {}
+      states: {},
+      spotifyEnabled: !!spotifyTokens[ntfyTopic]
     };
     notify(ntfyTopic, "BackLive is watching!", `Tracking: ${games.join(", ")}`);
     console.log(`[${ntfyTopic}] Started: ${games.join(", ")}`);
-    jsonRes(res, 200, { ok: true });
+    jsonRes(res, 200, { ok: true, spotifyConnected: !!spotifyTokens[ntfyTopic] });
     return;
   }
- 
+
   if (req.method === "GET" && url.pathname === "/status") {
     const id = url.searchParams.get("session");
     const s = sessions[id];
     if (!s) { jsonRes(res, 404, { error: "No session" }); return; }
-    jsonRes(res, 200, { games: s.games.map(g => ({ nickname: g.nickname, fullName: g.fullName, status: g.status, detail: g.detail })) });
+    jsonRes(res, 200, {
+      games: s.games.map(g => ({ nickname: g.nickname, fullName: g.fullName, status: g.status, detail: g.detail })),
+      spotifyConnected: !!spotifyTokens[id]
+    });
     return;
   }
- 
+
   if (req.method === "POST" && url.pathname === "/stop") {
     const { ntfyTopic } = await readBody(req);
     delete sessions[ntfyTopic];
     jsonRes(res, 200, { ok: true });
     return;
   }
- 
+
+  if (req.method === "GET" && url.pathname === "/spotify/login") {
+    const ntfyTopic = url.searchParams.get("session");
+    const scope = "user-modify-playback-state user-read-playback-state";
+    const params = new URLSearchParams({
+      response_type: "code", client_id: SPOTIFY_CLIENT_ID,
+      scope, redirect_uri: SPOTIFY_REDIRECT_URI, state: ntfyTopic
+    });
+    res.writeHead(302, { "Location": `https://accounts.spotify.com/authorize?${params}` });
+    res.end();
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/spotify/callback") {
+    const code = url.searchParams.get("code");
+    const ntfyTopic = url.searchParams.get("state");
+    if (!code || !ntfyTopic) { jsonRes(res, 400, { error: "Missing code or state" }); return; }
+    try {
+      const r = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Authorization": "Basic " + Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64")
+        },
+        body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: SPOTIFY_REDIRECT_URI })
+      });
+      const data = await r.json();
+      if (data.access_token) {
+        spotifyTokens[ntfyTopic] = {
+          accessToken: data.access_token,
+          refreshToken: data.refresh_token,
+          expiresAt: Date.now() + (data.expires_in * 1000)
+        };
+        if (sessions[ntfyTopic]) sessions[ntfyTopic].spotifyEnabled = true;
+        console.log(`[spotify:${ntfyTopic}] Connected`);
+        res.writeHead(302, { "Location": `https://backlive.netlify.app?spotify=connected&session=${encodeURIComponent(ntfyTopic)}` });
+        res.end();
+      } else {
+        jsonRes(res, 400, { error: "Spotify auth failed", details: data });
+      }
+    } catch (e) { jsonRes(res, 500, { error: e.message }); }
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/spotify/status") {
+    const id = url.searchParams.get("session");
+    jsonRes(res, 200, { connected: !!spotifyTokens[id] });
+    return;
+  }
+
   jsonRes(res, 404, { error: "Not found" });
- 
+
 }).listen(PORT, () => {
-  console.log(`BackLive v7 running on port ${PORT}`);
+  console.log(`BackLive v9 running on port ${PORT}`);
 });
- 
