@@ -1,15 +1,42 @@
 // ============================================================
-//  BACKLIVE SERVER v9 — Spotify + World Cup / Soccer
+//  BACKLIVE SERVER v10 — Persistent Spotify tokens
 // ============================================================
 
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
+
 const PORT = process.env.PORT || 3000;
 const POLL_MS = 25000;
-
 const SECRET_KEY = process.env.SECRET_KEY || "Lola";
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || "b9f103fdac944282ba3f56a03c866606";
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || "3007ce1e51a74d08ad91800025b0ce6d";
-const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || "https://backlive.netlify.app/callback";
+const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || "https://sports-alert-production.up.railway.app/spotify/callback";
+
+// ============================================================
+//  PERSISTENT TOKEN STORE
+//  Saves to /tmp/spotify_tokens.json so tokens survive restarts
+// ============================================================
+const TOKENS_FILE = path.join("/tmp", "spotify_tokens.json");
+
+function loadTokens() {
+  try {
+    if (fs.existsSync(TOKENS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(TOKENS_FILE, "utf8"));
+      console.log(`Loaded ${Object.keys(data).length} Spotify token(s) from disk`);
+      return data;
+    }
+  } catch (e) { console.error("Error loading tokens:", e.message); }
+  return {};
+}
+
+function saveTokens() {
+  try {
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(spotifyTokens, null, 2));
+  } catch (e) { console.error("Error saving tokens:", e.message); }
+}
+
+const spotifyTokens = loadTokens();
 
 // ============================================================
 //  TEAM ALIASES
@@ -69,7 +96,7 @@ const TEAM_ALIASES = {
   "senators":"ottawa senators","sens":"ottawa senators","sharks":"san jose sharks",
   "stars":"dallas stars","wild":"minnesota wild","winnipeg jets":"winnipeg jets",
   "florida panthers":"florida panthers","new york rangers":"new york rangers",
-  // World Cup / Soccer — all 48 teams
+  // World Cup / Soccer
   "usa":"united states","united states":"united states","usmnt":"united states",
   "mexico":"mexico","canada":"canada","argentina":"argentina","brazil":"brazil",
   "france":"france","england":"england","spain":"spain","portugal":"portugal",
@@ -144,25 +171,21 @@ function getSituation(event, sport) {
     const inning = status?.period || 1;
     const outs = (sit && sit.outs != null) ? sit.outs : null;
     const detail = status?.type?.shortDetail || "";
-    const detailLower = detail.toLowerCase();
-    const isEnd = detailLower.includes("end");
-    const half = detailLower.includes("bot") ? "bottom" : "top";
+    const isEnd = detail.toLowerCase().includes("end");
+    const half = detail.toLowerCase().includes("bot") ? "bottom" : "top";
     const label = isEnd ? `End of ${ord(inning)}` : `${half === "top" ? "Top" : "Bot"} ${ord(inning)}, ${outs ?? 0} outs`;
     return { sport: "mlb", inning, half, outs, isEnd, detail, label };
   }
-
   if (sport === "basketball/nba") {
     const clock = status.displayClock || "0:00";
     const period = status.period || 1;
     return { sport: "nba", clock, period, label: `${ord(period)} qtr, ${clock}` };
   }
-
   if (sport === "football/nfl") {
     const clock = status.displayClock || "0:00";
     const period = status.period || 1;
     return { sport: "nfl", clock, period, label: `${ord(period)} qtr, ${clock}` };
   }
-
   if (sport === "hockey/nhl") {
     const period = status.period || 1;
     const clock = status.displayClock || "0:00";
@@ -170,19 +193,15 @@ function getSituation(event, sport) {
     const intermission = detail.includes("end") || detail.includes("intermission") || clock === "0:00";
     return { sport: "nhl", period, clock, intermission, label: `Period ${period}, ${clock}` };
   }
-
   if (sport === "soccer/fifa.world") {
     const clock = status.displayClock || "0:00";
     const period = status.period || 1;
     const detail = status?.type?.shortDetail || "";
-    const detailLower = detail.toLowerCase();
-    // Halftime = commercial break. Extra time periods also tracked.
-    const isHalftime = detailLower.includes("ht") || detailLower.includes("half time") || detailLower.includes("halftime") || period === 2 && clock === "0:00";
-    const half = period <= 1 ? "1st Half" : period === 2 ? "2nd Half" : `Extra Time ${period - 2}`;
+    const isHalftime = detail.toLowerCase().includes("ht") || detail.toLowerCase().includes("half time") || detail.toLowerCase().includes("halftime");
+    const half = period <= 1 ? "1st Half" : period === 2 ? "2nd Half" : `Extra Time`;
     const label = isHalftime ? "Halftime" : `${half}, ${clock}`;
     return { sport: "soccer", period, clock, isHalftime, detail, label };
   }
-
   return null;
 }
 
@@ -205,8 +224,6 @@ async function notify(topic, title, body) {
 // ============================================================
 //  SPOTIFY
 // ============================================================
-const spotifyTokens = {};
-
 async function refreshSpotifyToken(ntfyTopic) {
   const tokens = spotifyTokens[ntfyTopic];
   if (!tokens?.refreshToken) return null;
@@ -223,6 +240,7 @@ async function refreshSpotifyToken(ntfyTopic) {
     if (data.access_token) {
       tokens.accessToken = data.access_token;
       tokens.expiresAt = Date.now() + (data.expires_in * 1000);
+      saveTokens(); // persist after refresh
       return data.access_token;
     }
   } catch (e) { console.error("Spotify refresh error:", e.message); }
@@ -244,7 +262,7 @@ async function spotifyPause(ntfyTopic) {
       method: "PUT", headers: { "Authorization": `Bearer ${token}` }
     });
     console.log(`[spotify:${ntfyTopic}] Paused`);
-  } catch (e) { console.error("Spotify pause error:", e.message); }
+  } catch (e) { console.error("Spotify pause:", e.message); }
 }
 
 async function spotifyResume(ntfyTopic) {
@@ -255,7 +273,7 @@ async function spotifyResume(ntfyTopic) {
       method: "PUT", headers: { "Authorization": `Bearer ${token}` }
     });
     console.log(`[spotify:${ntfyTopic}] Resumed`);
-  } catch (e) { console.error("Spotify resume error:", e.message); }
+  } catch (e) { console.error("Spotify resume:", e.message); }
 }
 
 // ============================================================
@@ -279,18 +297,16 @@ function processGame(session, game) {
       state.initialized = true;
       state.lastDetail = sit.detail;
       state.onCommercial = sit.isEnd;
-      console.log(`[${key}] Tracking started — ${sit.detail}`);
+      console.log(`[${key}] Tracking — ${sit.detail}`);
       return;
     }
-    const detailChanged = sit.detail !== state.lastDetail;
-    if (detailChanged) {
+    if (sit.detail !== state.lastDetail) {
       console.log(`[${key}] "${state.lastDetail}" -> "${sit.detail}"`);
       if (sit.isEnd && !state.onCommercial) {
         state.onCommercial = true;
-        console.log(`[${key}] Commercial started`);
+        console.log(`[${key}] Commercial`);
       } else if (!sit.isEnd && state.onCommercial) {
-        const half = sit.half === "top" ? "Top" : "Bottom";
-        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${half} of the ${ord(sit.inning)} starting.`);
+        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${sit.half === "top" ? "Top" : "Bottom"} of the ${ord(sit.inning)} starting.`);
         state.onCommercial = false;
         console.log(`[${key}] BACK LIVE`);
       }
@@ -306,11 +322,9 @@ function processGame(session, game) {
     const now = Date.now();
     if (!state.initialized) {
       state.initialized = true;
-      state.lastClock = sit.clock;
-      state.lastPeriod = sit.period;
-      state.lastChangedAt = now;
-      state.onCommercial = false;
-      console.log(`[${key}] Tracking started — ${sit.label}`);
+      state.lastClock = sit.clock; state.lastPeriod = sit.period;
+      state.lastChangedAt = now; state.onCommercial = false;
+      console.log(`[${key}] Tracking — ${sit.label}`);
       return;
     }
     const clockMoved = sit.clock !== state.lastClock || sit.period !== state.lastPeriod;
@@ -320,9 +334,7 @@ function processGame(session, game) {
         console.log(`[${key}] BACK LIVE`);
       }
       state.onCommercial = false;
-      state.lastClock = sit.clock;
-      state.lastPeriod = sit.period;
-      state.lastChangedAt = now;
+      state.lastClock = sit.clock; state.lastPeriod = sit.period; state.lastChangedAt = now;
       console.log(`[${key}] ${sit.label}`);
     } else {
       const frozen = now - state.lastChangedAt;
@@ -339,9 +351,8 @@ function processGame(session, game) {
   else if (sit.sport === "nhl") {
     if (!state.initialized) {
       state.initialized = true;
-      state.lastPeriod = sit.period;
-      state.onCommercial = sit.intermission;
-      console.log(`[${key}] Tracking started — Period ${sit.period}`);
+      state.lastPeriod = sit.period; state.onCommercial = sit.intermission;
+      console.log(`[${key}] Tracking — Period ${sit.period}`);
       return;
     }
     const periodChanged = sit.period !== state.lastPeriod;
@@ -363,26 +374,23 @@ function processGame(session, game) {
   else if (sit.sport === "soccer") {
     if (!state.initialized) {
       state.initialized = true;
-      state.lastDetail = sit.detail;
-      state.lastPeriod = sit.period;
+      state.lastDetail = sit.detail; state.lastPeriod = sit.period;
       state.onCommercial = sit.isHalftime;
-      console.log(`[${key}] Tracking started — ${sit.label}`);
+      console.log(`[${key}] Tracking — ${sit.label}`);
       return;
     }
-    const detailChanged = sit.detail !== state.lastDetail;
-    const periodChanged = sit.period !== state.lastPeriod;
-    if (detailChanged || periodChanged) {
+    const changed = sit.detail !== state.lastDetail || sit.period !== state.lastPeriod;
+    if (changed) {
       console.log(`[${key}] "${state.lastDetail}" -> "${sit.detail}"`);
       if (sit.isHalftime && !state.onCommercial) {
         state.onCommercial = true;
-        console.log(`[${key}] Halftime — commercial`);
+        console.log(`[${key}] Halftime`);
       } else if (!sit.isHalftime && state.onCommercial) {
         notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — 2nd half starting!`);
         state.onCommercial = false;
-        console.log(`[${key}] BACK LIVE — 2nd half`);
+        console.log(`[${key}] BACK LIVE`);
       }
-      state.lastDetail = sit.detail;
-      state.lastPeriod = sit.period;
+      state.lastDetail = sit.detail; state.lastPeriod = sit.period;
     } else {
       console.log(`[${key}] ${sit.label} — ${state.onCommercial ? "halftime" : "live"}`);
     }
@@ -390,11 +398,13 @@ function processGame(session, game) {
 
   game.status = state.onCommercial ? "commercial" : "live";
 
-  // ---- SPOTIFY: resume on commercial, pause when back live ----
+  // ---- SPOTIFY ----
   if (session.spotifyEnabled) {
     if (!wasOnCommercial && state.onCommercial) {
+      // just went to break — resume music
       spotifyResume(ntfyTopic);
     } else if (wasOnCommercial && !state.onCommercial) {
+      // just came back live — pause music
       spotifyPause(ntfyTopic);
     }
   }
@@ -409,15 +419,12 @@ async function pollAll() {
       try {
         if (!game.sport) game.sport = detectSport(game.nickname);
         const events = await fetchGames(game.sport);
-
         if (!game.espnId) {
           const event = findEvent(events, game.nickname);
           if (!event) { game.status = "not started"; game._sit = null; continue; }
-          game.espnId = event.id;
-          game.fullName = event.name;
+          game.espnId = event.id; game.fullName = event.name;
           console.log(`[${id}] Locked: ${event.name}`);
         }
-
         const event = events.find(e => e.id === game.espnId);
         if (!event) {
           game.status = "final"; game._sit = null; game.espnId = null;
@@ -425,19 +432,14 @@ async function pollAll() {
           console.log(`[${game.nickname}] Game ended`);
           continue;
         }
-
         const comp = event?.competitions?.[0];
         const status = comp?.status;
         const rawSit = comp?.situation;
         console.log(`[${game.nickname}] state=${status?.type?.state} detail="${status?.type?.shortDetail}" outs=${rawSit?.outs ?? "n/a"}`);
-
         const sit = getSituation(event, game.sport);
         if (!sit) { game.status = "not started"; game._sit = null; continue; }
-
-        game._sit = sit;
-        game.detail = sit.label;
+        game._sit = sit; game.detail = sit.label;
         processGame(session, game);
-
       } catch (e) {
         console.error(`[${id}/${game.nickname}]`, e.message);
         game.status = "error";
@@ -479,15 +481,16 @@ http.createServer(async (req, res) => {
     const { ntfyTopic, games, key } = body;
     if (key !== SECRET_KEY) { jsonRes(res, 401, { error: "Unauthorized" }); return; }
     if (!ntfyTopic || !games?.length) { jsonRes(res, 400, { error: "Missing ntfyTopic or games" }); return; }
+    const hasSpotify = !!spotifyTokens[ntfyTopic];
     sessions[ntfyTopic] = {
       ntfyTopic,
       games: games.map(n => ({ nickname: n, espnId: null, sport: null, status: "searching", detail: "", fullName: "", _sit: null })),
       states: {},
-      spotifyEnabled: !!spotifyTokens[ntfyTopic]
+      spotifyEnabled: hasSpotify
     };
     notify(ntfyTopic, "BackLive is watching!", `Tracking: ${games.join(", ")}`);
-    console.log(`[${ntfyTopic}] Started: ${games.join(", ")}`);
-    jsonRes(res, 200, { ok: true, spotifyConnected: !!spotifyTokens[ntfyTopic] });
+    console.log(`[${ntfyTopic}] Started: ${games.join(", ")} spotify=${hasSpotify}`);
+    jsonRes(res, 200, { ok: true, spotifyConnected: hasSpotify });
     return;
   }
 
@@ -511,10 +514,10 @@ http.createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname === "/spotify/login") {
     const ntfyTopic = url.searchParams.get("session");
-    const scope = "user-modify-playback-state user-read-playback-state";
     const params = new URLSearchParams({
       response_type: "code", client_id: SPOTIFY_CLIENT_ID,
-      scope, redirect_uri: SPOTIFY_REDIRECT_URI, state: ntfyTopic
+      scope: "user-modify-playback-state user-read-playback-state",
+      redirect_uri: SPOTIFY_REDIRECT_URI, state: ntfyTopic
     });
     res.writeHead(302, { "Location": `https://accounts.spotify.com/authorize?${params}` });
     res.end();
@@ -541,8 +544,9 @@ http.createServer(async (req, res) => {
           refreshToken: data.refresh_token,
           expiresAt: Date.now() + (data.expires_in * 1000)
         };
+        saveTokens(); // persist to disk
         if (sessions[ntfyTopic]) sessions[ntfyTopic].spotifyEnabled = true;
-        console.log(`[spotify:${ntfyTopic}] Connected`);
+        console.log(`[spotify:${ntfyTopic}] Connected & saved`);
         res.writeHead(302, { "Location": `https://backlive.netlify.app?spotify=connected&session=${encodeURIComponent(ntfyTopic)}` });
         res.end();
       } else {
@@ -561,5 +565,6 @@ http.createServer(async (req, res) => {
   jsonRes(res, 404, { error: "Not found" });
 
 }).listen(PORT, () => {
-  console.log(`BackLive v9 running on port ${PORT}`);
+  console.log(`BackLive v10 running on port ${PORT}`);
+  console.log(`Spotify tokens loaded: ${Object.keys(spotifyTokens).length}`);
 });
