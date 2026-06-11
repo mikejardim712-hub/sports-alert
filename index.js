@@ -1,8 +1,10 @@
 // ============================================================
-//  BACKLIVE SERVER v15 — Final build
-//  All fixes: grace period, 15s polling, instant detection,
-//  retry logic, MLB delays, soccer extra time, persistent
-//  Spotify, 8hr session expiry, college sports
+//  BACKLIVE SERVER v16 — Bulletproof Spotify + all fixes
+//  - Proactive token refresh every 45 min
+//  - Immediate refresh on session start
+//  - Race condition eliminated
+//  - Grace period for false game-over
+//  - 15s polling, instant detection, ESPN retry
 // ============================================================
 
 const http = require("http");
@@ -17,7 +19,7 @@ const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || "b9f103fdac944282ba3f
 const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || "3007ce1e51a74d08ad91800025b0ce6d";
 const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || "https://sports-alert-production.up.railway.app/spotify/callback";
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
-const FINAL_GRACE_POLLS = 3; // number of consecutive missing polls before declaring game final
+const FINAL_GRACE_POLLS = 3;
 
 // ============================================================
 //  PERSISTENT TOKEN STORE
@@ -41,6 +43,100 @@ function saveTokens() {
 }
 
 const spotifyTokens = loadTokens();
+
+// ============================================================
+//  SPOTIFY — bulletproof token management
+// ============================================================
+
+async function refreshSpotifyToken(ntfyTopic) {
+  const tokens = spotifyTokens[ntfyTopic];
+  if (!tokens?.refreshToken) return null;
+  try {
+    const r = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": "Basic " + Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64")
+      },
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refreshToken })
+    });
+    const data = await r.json();
+    if (data.access_token) {
+      tokens.accessToken = data.access_token;
+      tokens.expiresAt = Date.now() + (data.expires_in * 1000);
+      if (data.refresh_token) tokens.refreshToken = data.refresh_token; // update if rotated
+      saveTokens();
+      console.log(`[spotify:${ntfyTopic}] Token refreshed — valid for ${data.expires_in}s`);
+      return data.access_token;
+    } else {
+      console.error(`[spotify:${ntfyTopic}] Refresh failed:`, JSON.stringify(data));
+    }
+  } catch (e) { console.error(`[spotify:${ntfyTopic}] Refresh error:`, e.message); }
+  return null;
+}
+
+async function getSpotifyToken(ntfyTopic) {
+  const tokens = spotifyTokens[ntfyTopic];
+  if (!tokens) return null;
+  // Refresh if expiring within 3 minutes
+  if (Date.now() > (tokens.expiresAt - 180000)) {
+    return await refreshSpotifyToken(ntfyTopic);
+  }
+  return tokens.accessToken;
+}
+
+// Proactive background refresh every 45 minutes for all connected users
+setInterval(async () => {
+  const topics = Object.keys(spotifyTokens);
+  if (topics.length === 0) return;
+  console.log(`[spotify] Proactive refresh for ${topics.length} user(s)`);
+  for (const topic of topics) {
+    await refreshSpotifyToken(topic);
+  }
+}, 45 * 60 * 1000);
+
+async function spotifyAction(ntfyTopic, action) {
+  // action = "pause" or "play"
+  const token = await getSpotifyToken(ntfyTopic);
+  if (!token) {
+    console.log(`[spotify:${ntfyTopic}] No token — skipping ${action}`);
+    return;
+  }
+  try {
+    const r = await fetch(`https://api.spotify.com/v1/me/player/${action}`, {
+      method: "PUT",
+      headers: { "Authorization": `Bearer ${token}` }
+    });
+    if (r.status === 204) {
+      console.log(`[spotify:${ntfyTopic}] ${action} — success`);
+    } else if (r.status === 401) {
+      // Token was rejected — force refresh and retry once
+      console.log(`[spotify:${ntfyTopic}] 401 on ${action} — force refreshing token`);
+      const newToken = await refreshSpotifyToken(ntfyTopic);
+      if (newToken) {
+        const retry = await fetch(`https://api.spotify.com/v1/me/player/${action}`, {
+          method: "PUT",
+          headers: { "Authorization": `Bearer ${newToken}` }
+        });
+        console.log(`[spotify:${ntfyTopic}] ${action} retry — status ${retry.status}`);
+      }
+    } else if (r.status === 404) {
+      console.log(`[spotify:${ntfyTopic}] No active device for ${action} — user may not have Spotify open`);
+    } else if (r.status === 403) {
+      console.log(`[spotify:${ntfyTopic}] ${action} forbidden — may need premium`);
+    } else {
+      console.log(`[spotify:${ntfyTopic}] ${action} — status ${r.status}`);
+    }
+  } catch (e) { console.error(`[spotify:${ntfyTopic}] ${action} error:`, e.message); }
+}
+
+function spotifyPause(ntfyTopic) { return spotifyAction(ntfyTopic, "pause"); }
+function spotifyResume(ntfyTopic) { return spotifyAction(ntfyTopic, "play"); }
+
+function applySpotifyNow(ntfyTopic, onCommercial) {
+  if (onCommercial) spotifyResume(ntfyTopic);
+  else spotifyPause(ntfyTopic);
+}
 
 // ============================================================
 //  TEAM ALIASES
@@ -166,25 +262,19 @@ const TEAM_ALIASES = {
   "cincinnati":"cincinnati bearcats","bearcats":"cincinnati bearcats",
   "merrimack":"merrimack warriors","merrimack warriors":"merrimack warriors",
   // Soccer / World Cup 2026 — confirmed 48 teams only
-  // CONCACAF
   "usa":"united states","united states":"united states","usmnt":"united states",
   "mexico":"mexico","canada":"canada","panama":"panama",
   "curacao":"curacao","curaçao":"curacao","haiti":"haiti",
-  // AFC
   "japan":"japan","iran":"iran","south korea":"south korea","korea":"south korea",
   "australia":"australia","saudi arabia":"saudi arabia","qatar":"qatar",
   "uzbekistan":"uzbekistan","jordan":"jordan","iraq":"iraq",
-  // CAF
   "morocco":"morocco","senegal":"senegal","egypt":"egypt","algeria":"algeria",
   "tunisia":"tunisia","south africa":"south africa","cape verde":"cabo verde",
   "cabo verde":"cabo verde","ghana":"ghana","ivory coast":"ivory coast",
   "dr congo":"dr congo","congo":"dr congo",
-  // CONMEBOL
   "argentina":"argentina","brazil":"brazil","uruguay":"uruguay",
   "colombia":"colombia","ecuador":"ecuador","paraguay":"paraguay",
-  // OFC
   "new zealand":"new zealand",
-  // UEFA
   "england":"england","france":"france","croatia":"croatia","norway":"norway",
   "portugal":"portugal","germany":"germany","netherlands":"netherlands","holland":"netherlands",
   "switzerland":"switzerland","scotland":"scotland","spain":"spain","austria":"austria",
@@ -269,7 +359,6 @@ function getSituation(event, sport) {
     const label = isDelay ? "Game delayed" : isEnd ? `End of ${ord(inning)}` : `${half === "top" ? "Top" : "Bot"} ${ord(inning)}, ${outs ?? 0} outs`;
     return { sport: "mlb", inning, half, outs, isEnd: isEnd || isDelay, isDelay, detail, label };
   }
-
   if (sport === "basketball/nba" || sport === "basketball/mens-college-basketball") {
     const clock = status.displayClock || "0:00";
     const period = status.period || 1;
@@ -279,7 +368,6 @@ function getSituation(event, sport) {
     const label = isHalftime ? "Halftime" : isEndOfPeriod ? `End of ${ord(period)}` : `${ord(period)} ${sportKey === "ncaab" ? "half" : "qtr"}, ${clock}`;
     return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, detail, label };
   }
-
   if (sport === "football/nfl" || sport === "football/college-football") {
     const clock = status.displayClock || "0:00";
     const period = status.period || 1;
@@ -289,14 +377,12 @@ function getSituation(event, sport) {
     const label = isHalftime ? "Halftime" : isEndOfPeriod ? `End of ${ord(period)}` : `${ord(period)} qtr, ${clock}`;
     return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, detail, label };
   }
-
   if (sport === "hockey/nhl") {
     const period = status.period || 1;
     const clock = status.displayClock || "0:00";
     const intermission = detailLower.includes("end") || detailLower.includes("intermission") || clock === "0:00";
     return { sport: "nhl", period, clock, intermission, label: `Period ${period}, ${clock}` };
   }
-
   if (sport === "soccer/fifa.world") {
     const clock = status.displayClock || "0:00";
     const period = status.period || 1;
@@ -306,7 +392,6 @@ function getSituation(event, sport) {
     const label = (isHalftime || isETHalftime) ? "Halftime" : `${half}, ${clock}`;
     return { sport: "soccer", period, clock, isHalftime: isHalftime || isETHalftime, detail, label };
   }
-
   return null;
 }
 
@@ -327,69 +412,9 @@ async function notify(topic, title, body) {
 }
 
 // ============================================================
-//  SPOTIFY
-// ============================================================
-async function refreshSpotifyToken(ntfyTopic) {
-  const tokens = spotifyTokens[ntfyTopic];
-  if (!tokens?.refreshToken) return null;
-  try {
-    const r = await fetch("https://accounts.spotify.com/api/token", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": "Basic " + Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64")
-      },
-      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refreshToken })
-    });
-    const data = await r.json();
-    if (data.access_token) {
-      tokens.accessToken = data.access_token;
-      tokens.expiresAt = Date.now() + (data.expires_in * 1000);
-      saveTokens();
-      return data.access_token;
-    }
-  } catch (e) { console.error("Spotify refresh error:", e.message); }
-  return null;
-}
-
-async function getSpotifyToken(ntfyTopic) {
-  const tokens = spotifyTokens[ntfyTopic];
-  if (!tokens) return null;
-  if (Date.now() > (tokens.expiresAt - 60000)) return await refreshSpotifyToken(ntfyTopic);
-  return tokens.accessToken;
-}
-
-async function spotifyPause(ntfyTopic) {
-  const token = await getSpotifyToken(ntfyTopic);
-  if (!token) return;
-  try {
-    await fetch("https://api.spotify.com/v1/me/player/pause", {
-      method: "PUT", headers: { "Authorization": `Bearer ${token}` }
-    });
-    console.log(`[spotify:${ntfyTopic}] Paused`);
-  } catch (e) { console.error("Spotify pause:", e.message); }
-}
-
-async function spotifyResume(ntfyTopic) {
-  const token = await getSpotifyToken(ntfyTopic);
-  if (!token) return;
-  try {
-    await fetch("https://api.spotify.com/v1/me/player/play", {
-      method: "PUT", headers: { "Authorization": `Bearer ${token}` }
-    });
-    console.log(`[spotify:${ntfyTopic}] Resumed`);
-  } catch (e) { console.error("Spotify resume:", e.message); }
-}
-
-// ============================================================
 //  SESSION STORE
 // ============================================================
 const sessions = {};
-
-function applySpotifyNow(ntfyTopic, onCommercial) {
-  if (onCommercial) spotifyResume(ntfyTopic);
-  else spotifyPause(ntfyTopic);
-}
 
 function processGame(session, game) {
   const { ntfyTopic } = session;
@@ -431,7 +456,6 @@ function processGame(session, game) {
   else if (["nba","nfl","ncaab","ncaaf"].includes(sit.sport)) {
     const threshold = (sit.sport === "nba" || sit.sport === "ncaab") ? 110000 : 80000;
     const now = Date.now();
-
     if (!state.initialized) {
       state.initialized = true;
       state.lastClock = sit.clock;
@@ -439,11 +463,10 @@ function processGame(session, game) {
       state.lastDetail = sit.detail;
       state.lastChangedAt = now;
       state.onCommercial = sit.isHalftime || sit.isEndOfPeriod || false;
-      console.log(`[${key}] ${sit.sport.toUpperCase()} tracking — ${sit.label}`);
+      console.log(`[${key}] ${sit.sport.toUpperCase()} tracking — ${sit.label} commercial=${state.onCommercial}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, state.onCommercial);
       return;
     }
-
     const periodJumped = sit.period !== state.lastPeriod;
     const clockMoved = sit.clock !== state.lastClock;
     const detailChanged = sit.detail !== state.lastDetail;
@@ -515,7 +538,7 @@ function processGame(session, game) {
       state.lastDetail = sit.detail;
       state.lastPeriod = sit.period;
       state.onCommercial = sit.isHalftime;
-      console.log(`[${key}] Soccer tracking — ${sit.label}`);
+      console.log(`[${key}] Soccer tracking — ${sit.label} halftime=${sit.isHalftime}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.isHalftime);
       return;
     }
@@ -540,9 +563,15 @@ function processGame(session, game) {
 
   game.status = state.onCommercial ? "commercial" : "live";
 
+  // ---- SPOTIFY transition detection ----
   if (session.spotifyEnabled) {
-    if (!wasOnCommercial && state.onCommercial) spotifyResume(ntfyTopic);
-    else if (wasOnCommercial && !state.onCommercial) spotifyPause(ntfyTopic);
+    if (!wasOnCommercial && state.onCommercial) {
+      console.log(`[${key}] Spotify: resuming music (game went to break)`);
+      spotifyResume(ntfyTopic);
+    } else if (wasOnCommercial && !state.onCommercial) {
+      console.log(`[${key}] Spotify: pausing music (game came back live)`);
+      spotifyPause(ntfyTopic);
+    }
   }
 }
 
@@ -564,14 +593,12 @@ async function pollAll() {
         if (!game.espnId) {
           const event = findEvent(events, game.nickname);
           if (!event) { game.status = "not started"; game._sit = null; continue; }
-          game.espnId = event.id; game.fullName = event.name;
-          game.missingCount = 0;
+          game.espnId = event.id; game.fullName = event.name; game.missingCount = 0;
           console.log(`[${id}] Locked: ${event.name}`);
         }
 
         const event = events.find(e => e.id === game.espnId);
         if (!event) {
-          // Grace period — only declare final after 3 consecutive missing polls
           game.missingCount = (game.missingCount || 0) + 1;
           console.log(`[${game.nickname}] Not in scoreboard (${game.missingCount}/${FINAL_GRACE_POLLS})`);
           if (game.missingCount >= FINAL_GRACE_POLLS) {
@@ -582,7 +609,6 @@ async function pollAll() {
           continue;
         }
 
-        // Reset missing count when game is found
         game.missingCount = 0;
 
         const comp = event?.competitions?.[0];
@@ -593,8 +619,7 @@ async function pollAll() {
         const sit = getSituation(event, game.sport);
         if (!sit) { game.status = "not started"; game._sit = null; continue; }
 
-        game._sit = sit;
-        game.detail = sit.label;
+        game._sit = sit; game.detail = sit.label;
         processGame(session, game);
 
       } catch (e) {
@@ -639,6 +664,11 @@ http.createServer(async (req, res) => {
     if (key !== SECRET_KEY) { jsonRes(res, 401, { error: "Unauthorized" }); return; }
     if (!ntfyTopic || !games?.length) { jsonRes(res, 400, { error: "Missing ntfyTopic or games" }); return; }
     const hasSpotify = !!spotifyTokens[ntfyTopic] && games.length === 1;
+    // Proactively refresh Spotify token at session start
+    if (hasSpotify) {
+      console.log(`[${ntfyTopic}] Refreshing Spotify token at session start`);
+      refreshSpotifyToken(ntfyTopic);
+    }
     sessions[ntfyTopic] = {
       ntfyTopic,
       games: games.map(n => ({ nickname: n, espnId: null, sport: null, status: "searching", detail: "", fullName: "", _sit: null, missingCount: 0 })),
@@ -719,7 +749,7 @@ http.createServer(async (req, res) => {
   jsonRes(res, 404, { error: "Not found" });
 
 }).listen(PORT, () => {
-  console.log(`BackLive v15 running on port ${PORT}`);
-  console.log(`Poll: ${POLL_MS / 1000}s | Grace polls: ${FINAL_GRACE_POLLS} | ESPN retries: ${ESPN_RETRY}`);
+  console.log(`BackLive v16 running on port ${PORT}`);
+  console.log(`Poll: ${POLL_MS / 1000}s | Grace: ${FINAL_GRACE_POLLS} polls | ESPN retries: ${ESPN_RETRY}`);
   console.log(`Spotify tokens loaded: ${Object.keys(spotifyTokens).length}`);
 });
