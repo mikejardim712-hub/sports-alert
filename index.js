@@ -508,27 +508,51 @@ function processGame(session, game) {
 
   // ---- NHL ----
   else if (sit.sport === "nhl") {
+    const now = Date.now();
+
     if (!state.initialized) {
       state.initialized = true;
       state.lastPeriod = sit.period;
+      state.lastClock = sit.clock;
+      state.lastChangedAt = now;
       state.onCommercial = sit.intermission;
-      console.log(`[${key}] NHL tracking — Period ${sit.period} intermission=${sit.intermission}`);
+      console.log(`[${key}] NHL tracking — Period ${sit.period}, ${sit.clock} (detail: "${sit.detail}") intermission=${sit.intermission}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.intermission);
       return;
     }
+
     const periodChanged = sit.period !== state.lastPeriod;
-    if (periodChanged && state.onCommercial) {
-      notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)} period starting.`);
+    const clockMoved = sit.clock !== state.lastClock;
+    const detailLower = (sit.detail || "").toLowerCase();
+
+    // Only treat as commercial if ESPN explicitly says "timeout"
+    // Reviews, challenges, penalties etc. are excluded to avoid false positives
+    const isExplicitTimeout = detailLower.includes("timeout");
+
+    if (periodChanged || clockMoved) {
+      if (state.onCommercial) {
+        const msg = periodChanged
+          ? `${game.fullName || game.nickname} is back — ${ord(sit.period)} period starting.`
+          : `${game.fullName || game.nickname} is back live — ${sit.clock} left in the ${ord(sit.period)}.`;
+        notify(ntfyTopic, "Game is back!", msg);
+        console.log(`[${key}] NHL: BACK LIVE`);
+      }
       state.onCommercial = false;
-      console.log(`[${key}] NHL: BACK LIVE`);
-    } else if (sit.intermission && !state.onCommercial) {
-      state.onCommercial = true;
-      console.log(`[${key}] NHL: Intermission`);
-    } else if (!sit.intermission) {
-      state.onCommercial = false;
-      console.log(`[${key}] ${sit.label}`);
+      state.lastClock = sit.clock;
+      state.lastPeriod = sit.period;
+      state.lastChangedAt = now;
+      console.log(`[${key}] ${sit.label} (detail: "${sit.detail}")`);
+    } else {
+      if (sit.intermission && !state.onCommercial) {
+        state.onCommercial = true;
+        console.log(`[${key}] NHL: Intermission`);
+      } else if (isExplicitTimeout && !state.onCommercial) {
+        state.onCommercial = true;
+        console.log(`[${key}] NHL: Timeout detected — "${sit.detail}"`);
+      } else {
+        console.log(`[${key}] ${sit.label} (detail: "${sit.detail}") — no trigger`);
+      }
     }
-    state.lastPeriod = sit.period;
   }
 
   // ---- SOCCER ----
@@ -749,7 +773,7 @@ http.createServer(async (req, res) => {
   jsonRes(res, 404, { error: "Not found" });
 
 }).listen(PORT, () => {
-  console.log(`BackLive v16 running on port ${PORT}`);
+  console.log(`BackLive v18 running on port ${PORT}`);
   console.log(`Poll: ${POLL_MS / 1000}s | Grace: ${FINAL_GRACE_POLLS} polls | ESPN retries: ${ESPN_RETRY}`);
   console.log(`Spotify tokens loaded: ${Object.keys(spotifyTokens).length}`);
 });
