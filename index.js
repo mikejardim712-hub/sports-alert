@@ -45,6 +45,41 @@ function saveTokens() {
 const spotifyTokens = loadTokens();
 
 // ============================================================
+//  PUSH NOTIFICATION TOKEN STORE (favorite teams + conflict alerts)
+// ============================================================
+const PUSH_TOKENS_FILE = path.join("/tmp", "push_tokens.json");
+
+function loadPushTokens() {
+  try {
+    if (fs.existsSync(PUSH_TOKENS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PUSH_TOKENS_FILE, "utf8"));
+      console.log(`Loaded ${Object.keys(data).length} push token(s) from disk`);
+      return data;
+    }
+  } catch (e) { console.error("Error loading push tokens:", e.message); }
+  return {};
+}
+
+function savePushTokens() {
+  try { fs.writeFileSync(PUSH_TOKENS_FILE, JSON.stringify(pushTokens, null, 2)); }
+  catch (e) { console.error("Error saving push tokens:", e.message); }
+}
+
+const pushTokens = loadPushTokens(); // { expoPushToken: { favorites: [...], lastNotifiedDate: "YYYY-MM-DD" } }
+
+async function sendExpoPush(pushToken, title, body) {
+  try {
+    const r = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ to: pushToken, title, body, sound: "default" })
+    });
+    const data = await r.json();
+    console.log(`[push:${pushToken.slice(0, 20)}...] sent — ${JSON.stringify(data.data || data)}`);
+  } catch (e) { console.error("[push] send error:", e.message); }
+}
+
+// ============================================================
 //  SPOTIFY — bulletproof token management
 // ============================================================
 
@@ -658,6 +693,95 @@ setInterval(pollAll, POLL_MS);
 pollAll();
 
 // ============================================================
+//  CONFLICT DETECTION (shared by /schedule-check and daily push job)
+// ============================================================
+async function findScheduleConflicts(teams) {
+  const results = [];
+  const sportGroups = {};
+  for (const t of teams) {
+    const sport = detectSport(t.key);
+    if (!sportGroups[sport]) sportGroups[sport] = [];
+    sportGroups[sport].push(t);
+  }
+
+  for (const [sport, teamList] of Object.entries(sportGroups)) {
+    try {
+      const events = await fetchGames(sport);
+      for (const t of teamList) {
+        const event = findEvent(events, t.key);
+        if (event) {
+          const comp = event?.competitions?.[0];
+          const date = event?.date;
+          const status = comp?.status?.type?.state;
+          results.push({ key: t.key, sport: t.sport, name: event.name, date, status });
+        }
+      }
+    } catch (e) {
+      console.error(`[schedule-check] ${sport}:`, e.message);
+    }
+  }
+
+  const conflicts = [];
+  for (let i = 0; i < results.length; i++) {
+    for (let j = i + 1; j < results.length; j++) {
+      const a = results[i], b = results[j];
+      if (!a.date || !b.date) continue;
+      const diffMs = Math.abs(new Date(a.date).getTime() - new Date(b.date).getTime());
+      const twoHours = 2 * 60 * 60 * 1000;
+      if (diffMs <= twoHours && (a.status === "pre" || a.status === "in") && (b.status === "pre" || b.status === "in")) {
+        conflicts.push({ teamA: a, teamB: b });
+      }
+    }
+  }
+
+  return { games: results, conflicts };
+}
+
+// ============================================================
+//  DAILY PUSH NOTIFICATION JOB
+//  Checks every registered user's favorites once per day,
+//  sends a push if there's a same-day conflict.
+// ============================================================
+async function runDailyPushCheck() {
+  const today = new Date().toISOString().split("T")[0]; // "YYYY-MM-DD"
+  const tokens = Object.keys(pushTokens);
+  if (tokens.length === 0) return;
+
+  console.log(`[daily-push] Running check for ${tokens.length} user(s)`);
+
+  for (const token of tokens) {
+    const entry = pushTokens[token];
+    if (entry.lastNotifiedDate === today) continue; // already notified today
+    if (!entry.favorites || entry.favorites.length < 2) continue;
+
+    try {
+      const { conflicts } = await findScheduleConflicts(entry.favorites);
+      if (conflicts.length > 0) {
+        const c = conflicts[0];
+        const timeA = new Date(c.teamA.date).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+        const timeB = new Date(c.teamB.date).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+        await sendExpoPush(
+          token,
+          "Two of your teams play today!",
+          `${c.teamA.name} (${timeA}) and ${c.teamB.name} (${timeB}) — open BackLive to track both.`
+        );
+        entry.lastNotifiedDate = today;
+        savePushTokens();
+      }
+    } catch (e) {
+      console.error(`[daily-push] error for token ${token.slice(0, 20)}...:`, e.message);
+    }
+  }
+}
+
+// Run daily check every hour — fires once per user per day due to lastNotifiedDate check
+// Checking hourly (instead of once at a fixed time) means it works regardless of
+// what timezone Railway's clock is in, and catches games added/updated throughout the day
+setInterval(runDailyPushCheck, 60 * 60 * 1000);
+// Also run shortly after startup
+setTimeout(runDailyPushCheck, 30000);
+
+// ============================================================
 //  HTTP SERVER
 // ============================================================
 function jsonRes(res, code, data) {
@@ -776,10 +900,33 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/register-push") {
+    const body = await readBody(req);
+    const { pushToken, favorites } = body;
+    if (!pushToken || !favorites) { jsonRes(res, 400, { error: "Missing pushToken or favorites" }); return; }
+    pushTokens[pushToken] = {
+      favorites,
+      lastNotifiedDate: pushTokens[pushToken]?.lastNotifiedDate || null
+    };
+    savePushTokens();
+    console.log(`[push] Registered token ${pushToken.slice(0, 20)}... with ${favorites.length} favorites`);
+    jsonRes(res, 200, { ok: true });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/schedule-check") {
+    const body = await readBody(req);
+    const { teams } = body;
+    if (!teams?.length) { jsonRes(res, 400, { error: "Missing teams" }); return; }
+    const result = await findScheduleConflicts(teams);
+    jsonRes(res, 200, result);
+    return;
+  }
+
   jsonRes(res, 404, { error: "Not found" });
 
 }).listen(PORT, () => {
-  console.log(`BackLive v19 running on port ${PORT}`);
+  console.log(`BackLive v21 running on port ${PORT}`);
   console.log(`Poll: ${POLL_MS / 1000}s | Grace: ${FINAL_GRACE_POLLS} polls | ESPN retries: ${ESPN_RETRY}`);
   console.log(`Spotify tokens loaded: ${Object.keys(spotifyTokens).length}`);
 });
