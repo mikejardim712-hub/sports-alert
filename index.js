@@ -725,10 +725,12 @@ http.createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname === "/spotify/login") {
     const ntfyTopic = url.searchParams.get("session");
+    const platform = url.searchParams.get("platform") || "web";
+    const stateValue = `${ntfyTopic}|${platform}`;
     const params = new URLSearchParams({
       response_type: "code", client_id: SPOTIFY_CLIENT_ID,
       scope: "user-modify-playback-state user-read-playback-state",
-      redirect_uri: SPOTIFY_REDIRECT_URI, state: ntfyTopic
+      redirect_uri: SPOTIFY_REDIRECT_URI, state: stateValue
     });
     res.writeHead(302, { "Location": `https://accounts.spotify.com/authorize?${params}` });
     res.end();
@@ -737,7 +739,8 @@ http.createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname === "/spotify/callback") {
     const code = url.searchParams.get("code");
-    const ntfyTopic = url.searchParams.get("state");
+    const stateRaw = url.searchParams.get("state") || "";
+    const [ntfyTopic, platform] = stateRaw.split("|");
     if (!code || !ntfyTopic) { jsonRes(res, 400, { error: "Missing code or state" }); return; }
     try {
       const r = await fetch("https://accounts.spotify.com/api/token", {
@@ -756,8 +759,11 @@ http.createServer(async (req, res) => {
         };
         saveTokens();
         if (sessions[ntfyTopic]) sessions[ntfyTopic].spotifyEnabled = true;
-        console.log(`[spotify:${ntfyTopic}] Connected & saved`);
-        res.writeHead(302, { "Location": `https://backlive.netlify.app?spotify=connected&session=${encodeURIComponent(ntfyTopic)}` });
+        console.log(`[spotify:${ntfyTopic}] Connected & saved (platform=${platform || "web"})`);
+        const redirectUrl = platform === "app"
+          ? "backliveapp3://spotify-connected"
+          : `https://backlive.netlify.app?spotify=connected&session=${encodeURIComponent(ntfyTopic)}`;
+        res.writeHead(302, { "Location": redirectUrl });
         res.end();
       } else { jsonRes(res, 400, { error: "Spotify auth failed", details: data }); }
     } catch (e) { jsonRes(res, 500, { error: e.message }); }
@@ -773,7 +779,7 @@ http.createServer(async (req, res) => {
   jsonRes(res, 404, { error: "Not found" });
 
 }).listen(PORT, () => {
-  console.log(`BackLive v18 running on port ${PORT}`);
+  console.log(`BackLive v19 running on port ${PORT}`);
   console.log(`Poll: ${POLL_MS / 1000}s | Grace: ${FINAL_GRACE_POLLS} polls | ESPN retries: ${ESPN_RETRY}`);
   console.log(`Spotify tokens loaded: ${Object.keys(spotifyTokens).length}`);
 });
