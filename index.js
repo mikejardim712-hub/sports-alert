@@ -359,10 +359,29 @@ async function fetchGames(sport, attempt = 0) {
 function findEvent(events, nickname) {
   const nick = nickname.toLowerCase().replace(/ game$/, "").trim();
   const full = TEAM_ALIASES[nick] || nick;
+  const isCollege = full.split(" ").length >= 2 && (
+    NCAAF.includes(nick) || NCAAB.includes(nick) ||
+    Object.values(TEAM_ALIASES).filter(v => v === full).length > 0 &&
+    (full.includes("state") || full.includes("tar heels") || full.includes("wildcats") ||
+     full.includes("bulldogs") || full.includes("tigers") || full.includes("aggies") ||
+     full.includes("spartans") || full.includes("huskies") || full.includes("cardinal") ||
+     full.includes("crimson") || full.includes("cougars") || full.includes("warriors") ||
+     full.includes("longhorns") || full.includes("trojans") || full.includes("bruins"))
+  );
+
   for (const e of events) {
     const n = (e.name || "").toLowerCase();
     const s = (e.shortName || "").toLowerCase();
+    // Full-name match — always safe, try first
     if (n.includes(full) || s.includes(full)) return e;
+  }
+
+  // Mascot-only fallback — SKIP for college sports to avoid Spartans/Wildcats/etc collisions
+  if (isCollege) return null;
+
+  for (const e of events) {
+    const n = (e.name || "").toLowerCase();
+    const s = (e.shortName || "").toLowerCase();
     const last = full.split(" ").pop();
     if (last.length > 4 && (n.includes(last) || s.includes(last))) return e;
   }
@@ -693,6 +712,24 @@ setInterval(pollAll, POLL_MS);
 pollAll();
 
 // ============================================================
+//  SEASON CHECK — skip sports that aren't currently in season
+// ============================================================
+function isInSeason(sport) {
+  const m = new Date().getMonth() + 1; // 1-12
+  const y = new Date().getFullYear();
+  switch (sport) {
+    case "baseball/mlb": return m >= 3 && m <= 11;
+    case "basketball/nba": return m >= 10 || m <= 6;
+    case "football/nfl": return m >= 9 || m <= 1;
+    case "hockey/nhl": return m >= 10 || m <= 6;
+    case "football/college-football": return m >= 8 || m <= 1;
+    case "basketball/mens-college-basketball": return m >= 11 || m <= 4;
+    case "soccer/fifa.world": return y === 2026 && m >= 6 && m <= 7;
+    default: return true;
+  }
+}
+
+// ============================================================
 //  CONFLICT DETECTION (shared by /schedule-check and daily push job)
 // ============================================================
 async function findScheduleConflicts(teams) {
@@ -700,6 +737,10 @@ async function findScheduleConflicts(teams) {
   const sportGroups = {};
   for (const t of teams) {
     const sport = detectSport(t.key);
+    if (!isInSeason(sport)) {
+      console.log(`[schedule-check] Skipping ${t.key} — ${sport} not in season`);
+      continue;
+    }
     if (!sportGroups[sport]) sportGroups[sport] = [];
     sportGroups[sport].push(t);
   }
@@ -774,11 +815,31 @@ async function runDailyPushCheck() {
   }
 }
 
-// Run daily check every hour — fires once per user per day due to lastNotifiedDate check
-// Checking hourly (instead of once at a fixed time) means it works regardless of
-// what timezone Railway's clock is in, and catches games added/updated throughout the day
-setInterval(runDailyPushCheck, 60 * 60 * 1000);
-// Also run shortly after startup
+// Target 11am Eastern Time (handles EST/EDT automatically)
+function scheduleNextCheck() {
+  const now = new Date();
+
+  // Get current time in Eastern timezone
+  const easternNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const target = new Date(easternNow);
+  target.setHours(11, 0, 0, 0);
+  if (easternNow >= target) target.setDate(target.getDate() + 1); // tomorrow if past 11am today
+
+  // Convert the Eastern target time back to a real timestamp by computing the offset
+  const offsetMs = now.getTime() - easternNow.getTime();
+  const targetUtc = new Date(target.getTime() + offsetMs);
+
+  const msUntilTarget = targetUtc.getTime() - now.getTime();
+  console.log(`[daily-push] Next 11am ET check in ${Math.round(msUntilTarget / 60000)} minutes`);
+
+  setTimeout(() => {
+    runDailyPushCheck();
+    setInterval(runDailyPushCheck, 24 * 60 * 60 * 1000);
+  }, Math.max(msUntilTarget, 0));
+}
+
+scheduleNextCheck();
+// Safety net — also run shortly after startup in case server restarts mid-day
 setTimeout(runDailyPushCheck, 30000);
 
 // ============================================================
@@ -926,7 +987,7 @@ http.createServer(async (req, res) => {
   jsonRes(res, 404, { error: "Not found" });
 
 }).listen(PORT, () => {
-  console.log(`BackLive v21 running on port ${PORT}`);
+  console.log(`BackLive v24 running on port ${PORT}`);
   console.log(`Poll: ${POLL_MS / 1000}s | Grace: ${FINAL_GRACE_POLLS} polls | ESPN retries: ${ESPN_RETRY}`);
   console.log(`Spotify tokens loaded: ${Object.keys(spotifyTokens).length}`);
 });
