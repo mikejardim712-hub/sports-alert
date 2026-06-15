@@ -450,18 +450,28 @@ function getSituation(event, sport) {
 }
 
 // ============================================================
-//  NOTIFICATIONS
+//  NOTIFICATIONS — Expo push (primary) with legacy ntfy fallback
 // ============================================================
-async function notify(topic, title, body) {
+async function notify(identifier, title, body) {
+  if (!identifier) { console.log("[notify] No identifier — skipping"); return; }
+
+  // Expo push tokens look like "ExponentPushToken[...]"
+  if (identifier.startsWith("ExponentPushToken")) {
+    await sendExpoPush(identifier, title, body);
+    console.log(`[push:${identifier.slice(0, 20)}...] FIRED: ${title} — ${body}`);
+    return;
+  }
+
+  // Legacy ntfy topic (web version)
   try {
-    await fetch(`https://ntfy.sh/${topic}`, {
+    await fetch(`https://ntfy.sh/${identifier}`, {
       method: "POST", body,
       headers: {
         "Title": title.replace(/[^\x00-\x7F]/g, "").trim(),
         "Priority": "high", "Tags": "sports,tv"
       }
     });
-    console.log(`[ntfy:${topic}] FIRED: ${title} — ${body}`);
+    console.log(`[ntfy:${identifier}] FIRED: ${title} — ${body}`);
   } catch (e) { console.error("ntfy fail:", e.message); }
 }
 
@@ -869,24 +879,26 @@ http.createServer(async (req, res) => {
 
   if (req.method === "POST" && url.pathname === "/start") {
     const body = await readBody(req);
-    const { ntfyTopic, games, key } = body;
+    const { pushToken, ntfyTopic, games, key } = body;
+    const sessionId = pushToken || ntfyTopic; // app sends pushToken, web sends ntfyTopic
     if (key !== SECRET_KEY) { jsonRes(res, 401, { error: "Unauthorized" }); return; }
-    if (!ntfyTopic || !games?.length) { jsonRes(res, 400, { error: "Missing ntfyTopic or games" }); return; }
-    const hasSpotify = !!spotifyTokens[ntfyTopic] && games.length === 1;
+    if (!sessionId || !games?.length) { jsonRes(res, 400, { error: "Missing pushToken/ntfyTopic or games" }); return; }
+    const hasSpotify = !!spotifyTokens[sessionId] && games.length === 1;
     // Proactively refresh Spotify token at session start
     if (hasSpotify) {
-      console.log(`[${ntfyTopic}] Refreshing Spotify token at session start`);
-      refreshSpotifyToken(ntfyTopic);
+      console.log(`[${sessionId}] Refreshing Spotify token at session start`);
+      refreshSpotifyToken(sessionId);
     }
-    sessions[ntfyTopic] = {
-      ntfyTopic,
+    sessions[sessionId] = {
+      ntfyTopic: sessionId, // kept as internal field name; holds pushToken or legacy ntfy topic
+      pushToken: pushToken || null,
       games: games.map(n => ({ nickname: n, espnId: null, sport: null, status: "searching", detail: "", fullName: "", _sit: null, missingCount: 0 })),
       states: {}, spotifyEnabled: hasSpotify,
       expiresAt: Date.now() + SESSION_TTL_MS
     };
-    notify(ntfyTopic, "BackLive is watching!", `Tracking: ${games.join(", ")} (auto-stops in 8h)`);
-    console.log(`[${ntfyTopic}] Started: ${games.join(", ")} spotify=${hasSpotify}`);
-    jsonRes(res, 200, { ok: true, spotifyConnected: !!spotifyTokens[ntfyTopic], spotifyEnabled: hasSpotify });
+    notify(sessionId, "BackLive is watching!", `Tracking: ${games.join(", ")} (auto-stops in 8h)`);
+    console.log(`[${sessionId}] Started: ${games.join(", ")} spotify=${hasSpotify}`);
+    jsonRes(res, 200, { ok: true, spotifyConnected: !!spotifyTokens[sessionId], spotifyEnabled: hasSpotify });
     return;
   }
 
@@ -987,7 +999,7 @@ http.createServer(async (req, res) => {
   jsonRes(res, 404, { error: "Not found" });
 
 }).listen(PORT, () => {
-  console.log(`BackLive v24 running on port ${PORT}`);
+  console.log(`BackLive v25 running on port ${PORT}`);
   console.log(`Poll: ${POLL_MS / 1000}s | Grace: ${FINAL_GRACE_POLLS} polls | ESPN retries: ${ESPN_RETRY}`);
   console.log(`Spotify tokens loaded: ${Object.keys(spotifyTokens).length}`);
 });
