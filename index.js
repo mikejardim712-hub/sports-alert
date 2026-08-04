@@ -732,7 +732,7 @@ function isInSeason(sport) {
     case "basketball/nba": return m >= 10 || m <= 6;
     case "football/nfl": return m >= 9 || m <= 1;
     case "hockey/nhl": return m >= 10 || m <= 6;
-    case "football/college-football": return m >= 8 || m <= 1;
+    case "football/college-football": return m >= 9 || m <= 1;
     case "basketball/mens-college-basketball": return m >= 11 || m <= 4;
     case "soccer/fifa.world": return y === 2026 && m >= 6 && m <= 7;
     default: return true;
@@ -764,7 +764,7 @@ async function findScheduleConflicts(teams) {
           const comp = event?.competitions?.[0];
           const date = event?.date;
           const status = comp?.status?.type?.state;
-          results.push({ key: t.key, sport: t.sport, name: event.name, date, status });
+          results.push({ key: t.key, sport: t.sport, name: event.name, date, status, eventId: event.id });
         }
       }
     } catch (e) {
@@ -773,10 +773,19 @@ async function findScheduleConflicts(teams) {
   }
 
   const conflicts = [];
+  const todayStr = new Date().toISOString().split("T")[0];
   for (let i = 0; i < results.length; i++) {
     for (let j = i + 1; j < results.length; j++) {
       const a = results[i], b = results[j];
       if (!a.date || !b.date) continue;
+      // Skip if both teams are in the same game (playing each other)
+      if (a.eventId && b.eventId && a.eventId === b.eventId) continue;
+      // Also skip if game names match (same game, different alias)
+      if (a.name && b.name && a.name === b.name) continue;
+      // Only flag conflicts for games actually happening today
+      const aDate = new Date(a.date).toISOString().split("T")[0];
+      const bDate = new Date(b.date).toISOString().split("T")[0];
+      if (aDate !== todayStr || bDate !== todayStr) continue;
       const diffMs = Math.abs(new Date(a.date).getTime() - new Date(b.date).getTime());
       const twoHours = 2 * 60 * 60 * 1000;
       if (diffMs <= twoHours && (a.status === "pre" || a.status === "in") && (b.status === "pre" || b.status === "in")) {
@@ -999,7 +1008,7 @@ http.createServer(async (req, res) => {
   jsonRes(res, 404, { error: "Not found" });
 
 }).listen(PORT, () => {
-  console.log(`BackLive v25 running on port ${PORT}`);
+  console.log(`BackLive v28 running on port ${PORT}`);
   console.log(`Poll: ${POLL_MS / 1000}s | Grace: ${FINAL_GRACE_POLLS} polls | ESPN retries: ${ESPN_RETRY}`);
   console.log(`Spotify tokens loaded: ${Object.keys(spotifyTokens).length}`);
 });
