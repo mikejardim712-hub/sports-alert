@@ -12,7 +12,7 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-const POLL_MS = 15000;
+const POLL_MS = 8000;
 const ESPN_RETRY = 2;
 const SECRET_KEY = process.env.SECRET_KEY || "Lola";
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || "b9f103fdac944282ba3f56a03c866606";
@@ -282,6 +282,7 @@ const TEAM_ALIASES = {
   "demon deacons":"wake forest demon deacons","wake forest":"wake forest demon deacons",
   "orange":"syracuse orange","syracuse":"syracuse orange",
   "louisville":"louisville cardinals","army":"army black knights","navy":"navy midshipmen","byu":"byu cougars",
+  "miami fl":"miami hurricanes",
   // NCAAB
   "gonzaga":"gonzaga bulldogs","zags":"gonzaga bulldogs",
   "villanova":"villanova wildcats","nova":"villanova wildcats",
@@ -437,8 +438,9 @@ function getSituation(event, sport) {
     const sportKey = sport === "football/nfl" ? "nfl" : "ncaaf";
     const isHalftime = detailLower.includes("half") || detailLower.includes("ht");
     const isEndOfPeriod = detailLower.includes("end") || clock === "0:00";
-    const label = isHalftime ? "Halftime" : isEndOfPeriod ? `End of ${ord(period)}` : `${ord(period)} qtr, ${clock}`;
-    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, detail, label };
+    const isTimeout = detailLower.includes("timeout");
+    const label = isHalftime ? "Halftime" : isEndOfPeriod ? `End of ${ord(period)}` : isTimeout ? `Timeout, ${ord(period)} qtr` : `${ord(period)} qtr, ${clock}`;
+    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, isTimeout, detail, label };
   }
   if (sport === "hockey/nhl") {
     const period = status.period || 1;
@@ -527,15 +529,22 @@ function processGame(session, game) {
 
   // ---- NBA / NCAAB / NFL / NCAAF ----
   else if (["nba","nfl","ncaab","ncaaf"].includes(sit.sport)) {
+    // Basketball timeouts are short (20-75s) so a slower threshold avoids false
+    // positives on quick stoppages. Football stoppages long enough to freeze the
+    // clock (40s+) are almost always a real commercial break, so we can react faster.
+    // Football stoppages (replay reviews especially) can run 45-90s+ without
+    // actually going to a real commercial break, so the threshold needs to stay
+    // conservative — 45s caused a false "Break" on a replay review.
     const threshold = (sit.sport === "nba" || sit.sport === "ncaab") ? 110000 : 80000;
     const now = Date.now();
+    const isBreakSignal = sit.isHalftime || sit.isEndOfPeriod || sit.isTimeout;
     if (!state.initialized) {
       state.initialized = true;
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
       state.lastDetail = sit.detail;
       state.lastChangedAt = now;
-      state.onCommercial = sit.isHalftime || sit.isEndOfPeriod || false;
+      state.onCommercial = isBreakSignal || false;
       console.log(`[${key}] ${sit.sport.toUpperCase()} tracking — ${sit.label} commercial=${state.onCommercial}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, state.onCommercial);
       return;
@@ -546,10 +555,10 @@ function processGame(session, game) {
 
     if (detailChanged) {
       console.log(`[${key}] ${sit.sport.toUpperCase()}: "${state.lastDetail}" -> "${sit.detail}"`);
-      if ((sit.isHalftime || sit.isEndOfPeriod) && !state.onCommercial) {
+      if (isBreakSignal && !state.onCommercial) {
         state.onCommercial = true;
-        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (instant)`);
-      } else if (!sit.isHalftime && !sit.isEndOfPeriod && state.onCommercial && (clockMoved || periodJumped)) {
+        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (instant${sit.isTimeout ? " — timeout detected" : ""})`);
+      } else if (!isBreakSignal && state.onCommercial && (clockMoved || periodJumped)) {
         notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
         state.onCommercial = false;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE (instant)`);
@@ -675,29 +684,55 @@ function processGame(session, game) {
 // ============================================================
 //  MAIN POLL
 // ============================================================
+let pollInProgress = false;
+
 async function pollAll() {
-  for (const [id, session] of Object.entries(sessions)) {
-    if (session.expiresAt && Date.now() > session.expiresAt) {
-      console.log(`[${id}] Session expired — stopping`);
-      delete sessions[id];
-      continue;
+  // Guard against overlap: if a previous cycle is still running when the next
+  // tick fires (e.g. many concurrent games/sessions), skip this tick instead
+  // of stacking runs on top of each other.
+  if (pollInProgress) {
+    console.warn(`[pollAll] Previous cycle still running — skipping this tick to avoid overlap`);
+    return;
+  }
+  pollInProgress = true;
+
+  try {
+    // Dedupe ESPN calls within a single cycle — if two games (even across
+    // different sessions) are tracking the same sport, fetch it once and
+    // share the result, instead of hitting ESPN once per game.
+    const sportFetchCache = {};
+    function getEventsForSport(sport) {
+      if (!sportFetchCache[sport]) sportFetchCache[sport] = fetchGames(sport);
+      return sportFetchCache[sport];
     }
-    for (const game of session.games) {
+
+    // Flatten every (session, game) that needs checking this cycle
+    const tasks = [];
+    for (const [id, session] of Object.entries(sessions)) {
+      if (session.expiresAt && Date.now() > session.expiresAt) {
+        console.log(`[${id}] Session expired — stopping`);
+        delete sessions[id];
+        continue;
+      }
+      for (const game of session.games) tasks.push({ id, session, game });
+    }
+
+    // Process every game in parallel rather than one-at-a-time, so total
+    // cycle time no longer scales with the number of games/sessions.
+    await Promise.all(tasks.map(async ({ id, session, game }) => {
       try {
         if (!game.sport) game.sport = detectSport(game.nickname);
-        const events = await fetchGames(game.sport);
+        const events = await getEventsForSport(game.sport);
 
         if (!game.espnId) {
           const event = findEvent(events, game.nickname);
           if (!event) {
             game.status = "not started"; game._sit = null;
             game.searchMisses = (game.searchMisses || 0) + 1;
-            // Log every poll while still searching so failures are visible,
-            // but only print the full detail every ~4th attempt (1 min) to avoid spam
             if (game.searchMisses === 1 || game.searchMisses % 4 === 0) {
               console.log(`[${game.nickname}] Still searching for a match in ${events.length} ${game.sport} events (attempt ${game.searchMisses})`);
             }
-            continue;
+            return;
           }
           game.espnId = event.id; game.fullName = event.name; game.missingCount = 0; game.searchMisses = 0;
           console.log(`[${id}] Locked: "${event.name}" via endpoint=${game.sport}`);
@@ -712,7 +747,7 @@ async function pollAll() {
             notify(session.ntfyTopic, "Game over!", `${game.fullName || game.nickname} is final.`);
             console.log(`[${game.nickname}] Game ended (confirmed after ${FINAL_GRACE_POLLS} polls)`);
           }
-          continue;
+          return;
         }
 
         game.missingCount = 0;
@@ -723,7 +758,7 @@ async function pollAll() {
         console.log(`[${game.nickname}] state=${status?.type?.state} detail="${status?.type?.shortDetail}" outs=${rawSit?.outs ?? "n/a"}`);
 
         const sit = getSituation(event, game.sport);
-        if (!sit) { game.status = "not started"; game._sit = null; continue; }
+        if (!sit) { game.status = "not started"; game._sit = null; return; }
 
         game._sit = sit; game.detail = sit.label;
         processGame(session, game);
@@ -732,7 +767,9 @@ async function pollAll() {
         console.error(`[${id}/${game.nickname}]`, e.message);
         game.status = "error";
       }
-    }
+    }));
+  } finally {
+    pollInProgress = false;
   }
 }
 
