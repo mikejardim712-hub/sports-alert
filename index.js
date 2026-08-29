@@ -759,7 +759,25 @@ async function pollAll() {
         const comp = event?.competitions?.[0];
         const status = comp?.status;
         const rawSit = comp?.situation;
-        console.log(`[${game.nickname}] state=${status?.type?.state} detail="${status?.type?.shortDetail}" outs=${rawSit?.outs ?? "n/a"}`);
+        const espnState = status?.type?.state; // "pre" | "in" | "post"
+        console.log(`[${game.nickname}] state=${espnState} detail="${status?.type?.shortDetail}" outs=${rawSit?.outs ?? "n/a"}`);
+
+        if (espnState === "post") {
+          // Game finished — ESPN keeps it listed (state=post) rather than
+          // removing it, so check this directly instead of only relying on
+          // the game disappearing from the scoreboard entirely.
+          if (game.status !== "final") {
+            game.status = "final"; game._sit = null;
+            notify(session.ntfyTopic, "Game over!", `${game.fullName || game.nickname} is final. ${status?.type?.shortDetail || ""}`.trim());
+            console.log(`[${game.nickname}] Game ended — ESPN reports final (${status?.type?.shortDetail || status?.type?.description || "no detail"})`);
+          }
+          return;
+        }
+
+        if (espnState === "pre") {
+          game.status = "not started"; game._sit = null;
+          return;
+        }
 
         const sit = getSituation(event, game.sport);
         if (!sit) { game.status = "not started"; game._sit = null; return; }
