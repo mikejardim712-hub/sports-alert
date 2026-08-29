@@ -888,20 +888,37 @@ http.createServer(async (req, res) => {
 
   if (req.method === "POST" && url.pathname === "/start") {
     const body = await readBody(req);
-    const { pushToken, ntfyTopic, games, key } = body;
-    const sessionId = pushToken || ntfyTopic; // app sends pushToken, web sends ntfyTopic
+    const { pushToken, ntfyTopic, games, gameSports, key } = body;
+    const sessionId = pushToken || ntfyTopic;
     if (key !== SECRET_KEY) { jsonRes(res, 401, { error: "Unauthorized" }); return; }
     if (!sessionId || !games?.length) { jsonRes(res, 400, { error: "Missing pushToken/ntfyTopic or games" }); return; }
     const hasSpotify = !!spotifyTokens[sessionId] && games.length === 1;
-    // Proactively refresh Spotify token at session start
     if (hasSpotify) {
       console.log(`[${sessionId}] Refreshing Spotify token at session start`);
       refreshSpotifyToken(sessionId);
     }
+
+    // Sport map from UI tab IDs to ESPN endpoints
+    const sportEndpointMap = {
+      "mlb": "baseball/mlb",
+      "nba": "basketball/nba",
+      "nfl": "football/nfl",
+      "nhl": "hockey/nhl",
+      "ncaaf": "football/college-football",
+      "ncaab": "basketball/mens-college-basketball",
+      "soccer": "soccer/fifa.world",
+    };
+
     sessions[sessionId] = {
-      ntfyTopic: sessionId, // kept as internal field name; holds pushToken or legacy ntfy topic
+      ntfyTopic: sessionId,
       pushToken: pushToken || null,
-      games: games.map(n => ({ nickname: n, espnId: null, sport: null, status: "searching", detail: "", fullName: "", _sit: null, missingCount: 0 })),
+      games: games.map((n, i) => ({
+        nickname: n,
+        espnId: null,
+        // Use explicitly provided sport if available, fall back to detectSport
+        sport: gameSports?.[i] ? (sportEndpointMap[gameSports[i]] || detectSport(n)) : detectSport(n),
+        status: "searching", detail: "", fullName: "", _sit: null, missingCount: 0
+      })),
       states: {}, spotifyEnabled: hasSpotify,
       expiresAt: Date.now() + SESSION_TTL_MS
     };
@@ -1008,7 +1025,7 @@ http.createServer(async (req, res) => {
   jsonRes(res, 404, { error: "Not found" });
 
 }).listen(PORT, () => {
-  console.log(`BackLive v28 running on port ${PORT}`);
+  console.log(`BackLive v29 running on port ${PORT}`);
   console.log(`Poll: ${POLL_MS / 1000}s | Grace: ${FINAL_GRACE_POLLS} polls | ESPN retries: ${ESPN_RETRY}`);
   console.log(`Spotify tokens loaded: ${Object.keys(spotifyTokens).length}`);
 });
