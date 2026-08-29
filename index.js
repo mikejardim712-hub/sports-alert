@@ -340,15 +340,18 @@ function detectSport(n) {
 
 // ============================================================
 //  ESPN API WITH RETRY
-//  NCAA sports need groups=50 (all Division I) or ESPN silently
+//  NCAA sports need an explicit "groups" param or ESPN silently
 //  returns only a partial default slate — special/neutral-site
 //  games (like international/Week 0 matchups) can be missing
-//  entirely without it.
+//  entirely without it. Group IDs differ by sport:
+//  football/college-football -> 80 (all FBS)
+//  basketball/mens-college-basketball -> 50 (all Division I)
 // ============================================================
 async function fetchGames(sport, attempt = 0) {
   try {
-    const isCollege = sport === "football/college-football" || sport === "basketball/mens-college-basketball";
-    const params = isCollege ? "groups=50&limit=500" : "limit=100";
+    let params = "limit=100";
+    if (sport === "football/college-football") params = "groups=80&limit=500"; // 80 = all FBS
+    else if (sport === "basketball/mens-college-basketball") params = "groups=50&limit=500"; // 50 = all Division I
     const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard?${params}`);
     if (!r.ok) throw new Error(`ESPN ${r.status}`);
     return (await r.json()).events || [];
