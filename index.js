@@ -340,10 +340,16 @@ function detectSport(n) {
 
 // ============================================================
 //  ESPN API WITH RETRY
+//  NCAA sports need groups=50 (all Division I) or ESPN silently
+//  returns only a partial default slate — special/neutral-site
+//  games (like international/Week 0 matchups) can be missing
+//  entirely without it.
 // ============================================================
 async function fetchGames(sport, attempt = 0) {
   try {
-    const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard?limit=100`);
+    const isCollege = sport === "football/college-football" || sport === "basketball/mens-college-basketball";
+    const params = isCollege ? "groups=50&limit=500" : "limit=100";
+    const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard?${params}`);
     if (!r.ok) throw new Error(`ESPN ${r.status}`);
     return (await r.json()).events || [];
   } catch (e) {
@@ -680,9 +686,18 @@ async function pollAll() {
 
         if (!game.espnId) {
           const event = findEvent(events, game.nickname);
-          if (!event) { game.status = "not started"; game._sit = null; continue; }
-          game.espnId = event.id; game.fullName = event.name; game.missingCount = 0;
-          console.log(`[${id}] Locked: ${event.name}`);
+          if (!event) {
+            game.status = "not started"; game._sit = null;
+            game.searchMisses = (game.searchMisses || 0) + 1;
+            // Log every poll while still searching so failures are visible,
+            // but only print the full detail every ~4th attempt (1 min) to avoid spam
+            if (game.searchMisses === 1 || game.searchMisses % 4 === 0) {
+              console.log(`[${game.nickname}] Still searching for a match in ${events.length} ${game.sport} events (attempt ${game.searchMisses})`);
+            }
+            continue;
+          }
+          game.espnId = event.id; game.fullName = event.name; game.missingCount = 0; game.searchMisses = 0;
+          console.log(`[${id}] Locked: "${event.name}" via endpoint=${game.sport}`);
         }
 
         const event = events.find(e => e.id === game.espnId);
@@ -732,7 +747,7 @@ function isInSeason(sport) {
     case "basketball/nba": return m >= 10 || m <= 6;
     case "football/nfl": return m >= 9 || m <= 1;
     case "hockey/nhl": return m >= 10 || m <= 6;
-    case "football/college-football": return m >= 9 || m <= 1;
+    case "football/college-football": return m >= 8 || m <= 1;
     case "basketball/mens-college-basketball": return m >= 11 || m <= 4;
     case "soccer/fifa.world": return y === 2026 && m >= 6 && m <= 7;
     default: return true;
@@ -912,18 +927,27 @@ http.createServer(async (req, res) => {
     sessions[sessionId] = {
       ntfyTopic: sessionId,
       pushToken: pushToken || null,
-      games: games.map((n, i) => ({
-        nickname: n,
-        espnId: null,
-        // Use explicitly provided sport if available, fall back to detectSport
-        sport: gameSports?.[i] ? (sportEndpointMap[gameSports[i]] || detectSport(n)) : detectSport(n),
-        status: "searching", detail: "", fullName: "", _sit: null, missingCount: 0
-      })),
+      games: games.map((n, i) => {
+        const tag = gameSports?.[i];
+        const mapped = tag ? sportEndpointMap[tag] : null;
+        const finalSport = mapped || detectSport(n);
+        if (!tag) {
+          console.warn(`[${sessionId}] WARNING: "${n}" had no sport tag from the client — falling back to ambiguous detectSport() -> ${finalSport}. This can misidentify teams that exist in multiple sports (e.g. college football vs basketball).`);
+        } else if (!mapped) {
+          console.warn(`[${sessionId}] WARNING: "${n}" sent unrecognized sport tag "${tag}" — falling back to detectSport() -> ${finalSport}`);
+        }
+        return {
+          nickname: n,
+          espnId: null,
+          sport: finalSport,
+          status: "searching", detail: "", fullName: "", _sit: null, missingCount: 0, searchMisses: 0
+        };
+      }),
       states: {}, spotifyEnabled: hasSpotify,
       expiresAt: Date.now() + SESSION_TTL_MS
     };
     notify(sessionId, "BackLive is watching!", `Tracking: ${games.join(", ")} (auto-stops in 8h)`);
-    console.log(`[${sessionId}] Started: ${games.join(", ")} spotify=${hasSpotify}`);
+    console.log(`[${sessionId}] Started: ${games.join(", ")} sports=${JSON.stringify(gameSports)} spotify=${hasSpotify}`);
     jsonRes(res, 200, { ok: true, spotifyConnected: !!spotifyTokens[sessionId], spotifyEnabled: hasSpotify });
     return;
   }
@@ -1025,7 +1049,7 @@ http.createServer(async (req, res) => {
   jsonRes(res, 404, { error: "Not found" });
 
 }).listen(PORT, () => {
-  console.log(`BackLive v29 running on port ${PORT}`);
+  console.log(`BackLive v30 running on port ${PORT}`);
   console.log(`Poll: ${POLL_MS / 1000}s | Grace: ${FINAL_GRACE_POLLS} polls | ESPN retries: ${ESPN_RETRY}`);
   console.log(`Spotify tokens loaded: ${Object.keys(spotifyTokens).length}`);
 });
