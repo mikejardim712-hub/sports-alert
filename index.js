@@ -558,7 +558,11 @@ function processGame(session, game) {
       if (isBreakSignal && !state.onCommercial) {
         state.onCommercial = true;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (instant${sit.isTimeout ? " — timeout detected" : ""})`);
-      } else if (!isBreakSignal && state.onCommercial && (clockMoved || periodJumped)) {
+      } else if (!isBreakSignal && state.onCommercial) {
+        // Detail text moving away from a break signal (e.g. "Timeout" clearing,
+        // down/distance reappearing) is itself the resumption signal — don't
+        // also wait for the clock to have already ticked, since that requires
+        // an entire play to happen first and causes a real one-play lag.
         notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
         state.onCommercial = false;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE (instant)`);
