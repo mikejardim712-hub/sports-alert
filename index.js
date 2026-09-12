@@ -12,7 +12,7 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-const POLL_MS = 8000;
+const POLL_MS = 5000;
 const ESPN_RETRY = 2;
 const SECRET_KEY = process.env.SECRET_KEY || "Lola";
 const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || "b9f103fdac944282ba3f56a03c866606";
@@ -20,6 +20,10 @@ const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || "3007ce1e51a7
 const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || "https://sports-alert-production.up.railway.app/spotify/callback";
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const FINAL_GRACE_POLLS = 3;
+// A quick timeout/mid-inning break stays a silent badge; if it runs this long
+// without resolving, it's treated as a real break and eventually notifies.
+const NHL_TIMEOUT_ESCALATE_MS = 90000;
+const MID_INNING_ESCALATE_MS = 90000;
 
 // ============================================================
 //  PERSISTENT TOKEN STORE
@@ -67,7 +71,46 @@ function savePushTokens() {
 
 const pushTokens = loadPushTokens(); // { expoPushToken: { favorites: [...], lastNotifiedDate: "YYYY-MM-DD" } }
 
-async function sendExpoPush(pushToken, title, body) {
+// ============================================================
+//  SESSION PERSISTENCE — survive Railway restarts/redeploys
+//  Without this, any server restart silently kills every active
+//  game-tracking session with no warning: notifications and
+//  Spotify sync just stop, and the user has no idea why.
+//  Only the "what to watch" setup is persisted, not moment-to-moment
+//  tracking state (states/_sit) — that's cheap to re-initialize
+//  quietly on the next poll after a restore.
+// ============================================================
+const SESSIONS_FILE = path.join("/tmp", "sessions.json");
+
+function loadPersistedSessions() {
+  try {
+    if (fs.existsSync(SESSIONS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8"));
+      console.log(`Loaded ${Object.keys(data).length} persisted session(s) from disk`);
+      return data;
+    }
+  } catch (e) { console.error("Error loading sessions:", e.message); }
+  return {};
+}
+
+function saveSessions() {
+  try {
+    // Persist only what's needed to resume tracking, not live/ephemeral state
+    const toSave = {};
+    for (const [id, s] of Object.entries(sessions)) {
+      toSave[id] = {
+        ntfyTopic: s.ntfyTopic,
+        pushToken: s.pushToken,
+        spotifyEnabled: s.spotifyEnabled,
+        expiresAt: s.expiresAt,
+        games: s.games.map(g => ({ nickname: g.nickname, sport: g.sport }))
+      };
+    }
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(toSave, null, 2));
+  } catch (e) { console.error("Error saving sessions:", e.message); }
+}
+
+async function sendExpoPush(pushToken, title, body, attempt = 0) {
   try {
     const r = await fetch("https://exp.host/--/api/v2/push/send", {
       method: "POST",
@@ -75,8 +118,21 @@ async function sendExpoPush(pushToken, title, body) {
       body: JSON.stringify({ to: pushToken, title, body, sound: "default" })
     });
     const data = await r.json();
-    console.log(`[push:${pushToken.slice(0, 20)}...] sent — ${JSON.stringify(data.data || data)}`);
-  } catch (e) { console.error("[push] send error:", e.message); }
+    const result = data?.data;
+    if (result?.status === "error") {
+      // Expo accepted the HTTP request but rejected the push itself (e.g. bad/expired token)
+      console.error(`[push:${pushToken.slice(0, 20)}...] REJECTED — ${result.message || JSON.stringify(result)}`);
+      return;
+    }
+    console.log(`[push:${pushToken.slice(0, 20)}...] sent — ${JSON.stringify(result || data)}`);
+  } catch (e) {
+    if (attempt < 2) {
+      console.log(`[push] Send failed (${e.message}), retrying (${attempt + 1}/2)...`);
+      await new Promise(res => setTimeout(res, 1500));
+      return sendExpoPush(pushToken, title, body, attempt + 1);
+    }
+    console.error(`[push:${pushToken.slice(0, 20)}...] send FAILED after retries:`, e.message);
+  }
 }
 
 // ============================================================
@@ -402,6 +458,19 @@ function ord(n) {
   return n === 1 ? "1st" : n === 2 ? "2nd" : n === 3 ? "3rd" : `${n}th`;
 }
 
+// Appends a quick recap of the most recent play, if ESPN's data included one —
+// safety net in case the notification lands just after a play already happened.
+// Only include a recap if the last-known play actually CHANGED since the break
+// started — otherwise ESPN's lastPlay field is just showing the pre-break play,
+// which would make the recap pointless (or worse, misleading).
+function recapIfNew(sit, state) {
+  if (sit?.lastPlay && sit.lastPlay !== state.lastPlayAtBreakStart) return sit.lastPlay;
+  return null;
+}
+function withRecap(baseMsg, recapText) {
+  return recapText ? `${baseMsg} You missed: ${recapText}` : baseMsg;
+}
+
 // ============================================================
 //  SITUATION EXTRACTORS
 // ============================================================
@@ -412,16 +481,24 @@ function getSituation(event, sport) {
 
   const detail = status?.type?.shortDetail || "";
   const detailLower = detail.toLowerCase();
+  // ESPN's scoreboard often includes a short description of the most recent
+  // play — used to give a quick recap in "Game is back!" notifications in
+  // case the notification arrives just after a play has already happened.
+  // Handles both the documented shape (lastPlay.text) and the case where
+  // ESPN occasionally returns it as a bare string instead.
+  const rawLastPlay = comp?.situation?.lastPlay;
+  const lastPlay = (rawLastPlay?.text) || (typeof rawLastPlay === "string" ? rawLastPlay : null);
 
   if (sport === "baseball/mlb") {
     const sit = comp?.situation;
     const inning = status?.period || 1;
     const outs = (sit && sit.outs != null) ? sit.outs : null;
     const isEnd = detailLower.includes("end");
+    const isMidInning = detailLower.includes("mid"); // top->bottom of the SAME inning
     const isDelay = detailLower.includes("delay") || detailLower.includes("suspend") || detailLower.includes("postpone");
     const half = detailLower.includes("bot") ? "bottom" : "top";
-    const label = isDelay ? "Game delayed" : isEnd ? `End of ${ord(inning)}` : `${half === "top" ? "Top" : "Bot"} ${ord(inning)}, ${outs ?? 0} outs`;
-    return { sport: "mlb", inning, half, outs, isEnd: isEnd || isDelay, isDelay, detail, label };
+    const label = isDelay ? "Game delayed" : isEnd ? `End of ${ord(inning)}` : isMidInning ? `Mid ${ord(inning)}` : `${half === "top" ? "Top" : "Bot"} ${ord(inning)}, ${outs ?? 0} outs`;
+    return { sport: "mlb", inning, half, outs, isEnd: isEnd || isDelay, isDelay, isMidInning, isTimeout: isMidInning, detail, label, lastPlay };
   }
   if (sport === "basketball/nba" || sport === "basketball/mens-college-basketball") {
     const clock = status.displayClock || "0:00";
@@ -429,8 +506,15 @@ function getSituation(event, sport) {
     const sportKey = sport === "basketball/nba" ? "nba" : "ncaab";
     const isHalftime = detailLower.includes("half") || detailLower.includes("ht");
     const isEndOfPeriod = detailLower.includes("end") || clock === "0:00";
-    const label = isHalftime ? "Halftime" : isEndOfPeriod ? `End of ${ord(period)}` : `${ord(period)} ${sportKey === "ncaab" ? "half" : "qtr"}, ${clock}`;
-    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, detail, label };
+    const isTimeout = detailLower.includes("timeout");
+    const isReview = detailLower.includes("review") || detailLower.includes("challenge");
+    const label = isHalftime ? "Halftime" : isEndOfPeriod ? `End of ${ord(period)}` : isTimeout ? `Timeout, ${ord(period)} ${sportKey === "ncaab" ? "half" : "qtr"}` : isReview ? `Under review, ${ord(period)} ${sportKey === "ncaab" ? "half" : "qtr"}` : `${ord(period)} ${sportKey === "ncaab" ? "half" : "qtr"}, ${clock}`;
+    // Score is used as a fallback "definitely live" signal — if it changes
+    // while we think the game is on break, that's undeniable proof the ball
+    // was live, even if our clock/detail parsing missed the exact moment.
+    const competitors = comp?.competitors || [];
+    const score = competitors.length >= 2 ? competitors.map(c => c.score).join("-") : null;
+    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, isTimeout, isReview, detail, label, lastPlay, score };
   }
   if (sport === "football/nfl" || sport === "football/college-football") {
     const clock = status.displayClock || "0:00";
@@ -439,23 +523,26 @@ function getSituation(event, sport) {
     const isHalftime = detailLower.includes("half") || detailLower.includes("ht");
     const isEndOfPeriod = detailLower.includes("end") || clock === "0:00";
     const isTimeout = detailLower.includes("timeout");
-    const label = isHalftime ? "Halftime" : isEndOfPeriod ? `End of ${ord(period)}` : isTimeout ? `Timeout, ${ord(period)} qtr` : `${ord(period)} qtr, ${clock}`;
-    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, isTimeout, detail, label };
+    const isReview = detailLower.includes("review") || detailLower.includes("challenge");
+    const label = isHalftime ? "Halftime" : isEndOfPeriod ? `End of ${ord(period)}` : isTimeout ? `Timeout, ${ord(period)} qtr` : isReview ? `Under review, ${ord(period)} qtr` : `${ord(period)} qtr, ${clock}`;
+    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, isTimeout, isReview, detail, label, lastPlay };
   }
   if (sport === "hockey/nhl") {
     const period = status.period || 1;
     const clock = status.displayClock || "0:00";
     const intermission = detailLower.includes("end") || detailLower.includes("intermission") || clock === "0:00";
-    return { sport: "nhl", period, clock, intermission, label: `Period ${period}, ${clock}` };
+    const isReview = detailLower.includes("review") || detailLower.includes("challenge");
+    return { sport: "nhl", period, clock, intermission, isReview, lastPlay, label: `Period ${period}, ${clock}` };
   }
   if (sport === "soccer/fifa.world") {
     const clock = status.displayClock || "0:00";
     const period = status.period || 1;
     const isHalftime = detailLower.includes("ht") || detailLower.includes("half time") || detailLower.includes("halftime");
     const isETHalftime = period > 2 && (detailLower.includes("ht") || detailLower.includes("break"));
+    const isReview = detailLower.includes("var") || detailLower.includes("review");
     const half = period === 1 ? "1st Half" : period === 2 ? "2nd Half" : period === 3 ? "ET 1st" : "ET 2nd";
-    const label = (isHalftime || isETHalftime) ? "Halftime" : `${half}, ${clock}`;
-    return { sport: "soccer", period, clock, isHalftime: isHalftime || isETHalftime, detail, label };
+    const label = (isHalftime || isETHalftime) ? "Halftime" : isReview ? `VAR review, ${half}` : `${half}, ${clock}`;
+    return { sport: "soccer", period, clock, isHalftime: isHalftime || isETHalftime, isReview, detail, label, lastPlay };
   }
   return null;
 }
@@ -491,6 +578,29 @@ async function notify(identifier, title, body) {
 // ============================================================
 const sessions = {};
 
+// Restore any sessions that were active before a restart. Live tracking state
+// (states/_sit) intentionally starts fresh — it'll quietly re-initialize on
+// the very next poll rather than trying to guess what it missed.
+(function restoreSessions() {
+  const persisted = loadPersistedSessions();
+  const now = Date.now();
+  let restored = 0, expired = 0;
+  for (const [id, s] of Object.entries(persisted)) {
+    if (s.expiresAt && now > s.expiresAt) { expired++; continue; } // don't resurrect old sessions
+    sessions[id] = {
+      ntfyTopic: s.ntfyTopic,
+      pushToken: s.pushToken,
+      games: s.games.map(g => ({
+        nickname: g.nickname, espnId: null, sport: g.sport,
+        status: "searching", detail: "", fullName: "", _sit: null, missingCount: 0, searchMisses: 0
+      })),
+      states: {}, spotifyEnabled: s.spotifyEnabled, expiresAt: s.expiresAt
+    };
+    restored++;
+  }
+  if (restored || expired) console.log(`[restore] Resumed ${restored} session(s), skipped ${expired} already-expired`);
+})();
+
 function processGame(session, game) {
   const { ntfyTopic } = session;
   const key = game.nickname;
@@ -503,10 +613,13 @@ function processGame(session, game) {
 
   // ---- MLB ----
   if (sit.sport === "mlb") {
+    const now = Date.now();
     if (!state.initialized) {
       state.initialized = true;
       state.lastDetail = sit.detail;
+      state.lastChangedAt = now;
       state.onCommercial = sit.isEnd;
+      state.lastPlayAtBreakStart = sit.isEnd ? sit.lastPlay : null;
       console.log(`[${key}] MLB tracking — ${sit.detail} commercial=${sit.isEnd}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.isEnd);
       return;
@@ -514,14 +627,31 @@ function processGame(session, game) {
     if (sit.detail !== state.lastDetail) {
       console.log(`[${key}] MLB: "${state.lastDetail}" -> "${sit.detail}"`);
       if (sit.isEnd && !state.onCommercial) {
+        // Full-inning break (bottom of an inning just ended) — always a real
+        // break, instant, same as before.
         state.onCommercial = true;
+        state.lastPlayAtBreakStart = sit.lastPlay || null;
         console.log(`[${key}] MLB: Commercial${sit.isDelay ? " (delay)" : ""}`);
-      } else if (!sit.isEnd && state.onCommercial) {
-        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${sit.half === "top" ? "Top" : "Bottom"} of the ${ord(sit.inning)} starting.`);
+      } else if (!sit.isEnd && !sit.isMidInning && state.onCommercial) {
+        // Resuming play — whether this was a full-inning break or a mid-inning
+        // break that had escalated below — fires the same way either way.
+        notify(ntfyTopic, "Game is back!", withRecap(`${game.fullName || game.nickname} is back — ${sit.half === "top" ? "Top" : "Bottom"} of the ${ord(sit.inning)} starting.`, recapIfNew(sit, state)));
         state.onCommercial = false;
         console.log(`[${key}] MLB: BACK LIVE`);
       }
       state.lastDetail = sit.detail;
+      state.lastChangedAt = now;
+    } else if (sit.isMidInning && !state.onCommercial) {
+      // Detail text unchanged, still showing "Mid Xth" — check if it's been
+      // going long enough to treat as a real break rather than a quick pause.
+      const frozen = now - state.lastChangedAt;
+      if (frozen >= MID_INNING_ESCALATE_MS) {
+        state.onCommercial = true;
+        state.lastPlayAtBreakStart = sit.lastPlay || null;
+        console.log(`[${key}] MLB: Mid-inning break escalated to real break after ${Math.round(frozen / 1000)}s`);
+      } else {
+        console.log(`[${key}] ${sit.label} — mid-inning, ${Math.round(frozen / 1000)}s / ${MID_INNING_ESCALATE_MS / 1000}s`);
+      }
     } else {
       console.log(`[${key}] ${sit.label} — ${state.onCommercial ? "commercial" : "live"}`);
     }
@@ -532,12 +662,13 @@ function processGame(session, game) {
     // Basketball timeouts are short (20-75s) so a slower threshold avoids false
     // positives on quick stoppages. Football stoppages long enough to freeze the
     // clock (40s+) are almost always a real commercial break, so we can react faster.
-    // Football stoppages (replay reviews especially) can run 45-90s+ without
-    // actually going to a real commercial break, so the threshold needs to stay
-    // conservative — 45s caused a false "Break" on a replay review.
     const threshold = (sit.sport === "nba" || sit.sport === "ncaab") ? 110000 : 80000;
     const now = Date.now();
-    const isBreakSignal = sit.isHalftime || sit.isEndOfPeriod || sit.isTimeout;
+    // Only halftime/end-of-period count as an INSTANT real break — a plain
+    // timeout might be quick and never actually cut to commercial, so it only
+    // becomes a real break if the clock stays frozen long enough (below).
+    const isBreakSignal = sit.isHalftime || sit.isEndOfPeriod;
+    const isBasketball = sit.sport === "nba" || sit.sport === "ncaab";
     if (!state.initialized) {
       state.initialized = true;
       state.lastClock = sit.clock;
@@ -545,10 +676,30 @@ function processGame(session, game) {
       state.lastDetail = sit.detail;
       state.lastChangedAt = now;
       state.onCommercial = isBreakSignal || false;
+      state.lastPlayAtBreakStart = state.onCommercial ? sit.lastPlay : null;
+      if (isBasketball) state.lastScore = sit.score;
       console.log(`[${key}] ${sit.sport.toUpperCase()} tracking — ${sit.label} commercial=${state.onCommercial}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, state.onCommercial);
       return;
     }
+
+    // Fallback signal for basketball: if we think the game is on break but the
+    // score just changed anyway, that's undeniable proof the ball was live —
+    // catches transitions that happened entirely within a single poll gap and
+    // were never directly observed (e.g. a timeout ending, one possession
+    // happening, and another stoppage starting, all inside 5 seconds).
+    if (isBasketball && state.onCommercial && sit.score && state.lastScore && sit.score !== state.lastScore) {
+      notify(ntfyTopic, "Game is back!", withRecap(`${game.fullName || game.nickname} is back — score is now ${sit.score}.`, recapIfNew(sit, state)));
+      state.onCommercial = false;
+      state.lastScore = sit.score;
+      state.lastDetail = sit.detail;
+      state.lastClock = sit.clock;
+      state.lastPeriod = sit.period;
+      state.lastChangedAt = now;
+      console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE (score-change fallback — missed the direct transition, score now ${sit.score})`);
+      return;
+    }
+    if (isBasketball) state.lastScore = sit.score;
     const periodJumped = sit.period !== state.lastPeriod;
     const clockMoved = sit.clock !== state.lastClock;
     const detailChanged = sit.detail !== state.lastDetail;
@@ -557,13 +708,14 @@ function processGame(session, game) {
       console.log(`[${key}] ${sit.sport.toUpperCase()}: "${state.lastDetail}" -> "${sit.detail}"`);
       if (isBreakSignal && !state.onCommercial) {
         state.onCommercial = true;
-        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (instant${sit.isTimeout ? " — timeout detected" : ""})`);
+        state.lastPlayAtBreakStart = sit.lastPlay || null;
+        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (instant)`);
       } else if (!isBreakSignal && state.onCommercial) {
         // Detail text moving away from a break signal (e.g. "Timeout" clearing,
         // down/distance reappearing) is itself the resumption signal — don't
         // also wait for the clock to have already ticked, since that requires
         // an entire play to happen first and causes a real one-play lag.
-        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
+        notify(ntfyTopic, "Game is back!", withRecap(`${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`, recapIfNew(sit, state)));
         state.onCommercial = false;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE (instant)`);
       }
@@ -573,7 +725,7 @@ function processGame(session, game) {
       state.lastChangedAt = now;
     } else if (clockMoved || periodJumped) {
       if (state.onCommercial) {
-        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
+        notify(ntfyTopic, "Game is back!", withRecap(`${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`, recapIfNew(sit, state)));
         state.onCommercial = false;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE`);
       }
@@ -583,9 +735,20 @@ function processGame(session, game) {
       console.log(`[${key}] ${sit.label}`);
     } else {
       const frozen = now - state.lastChangedAt;
-      if (frozen >= threshold && !state.onCommercial) {
+      if (sit.isReview) {
+        // Replay reviews/challenges can run 45-90s+ but rarely correspond to
+        // a real commercial break — the broadcast usually just shows the
+        // review live. Keep resetting the clock so review time never counts
+        // toward the break threshold, no matter how long it runs.
+        state.lastChangedAt = now;
+        console.log(`[${key}] ${sit.label} — excluded from break threshold (under review)`);
+      } else if (frozen >= threshold && !state.onCommercial) {
+        // A quick timeout won't reach here (it resolves before the threshold).
+        // One that drags on this long — timeout-labeled or not — is treated
+        // as a real break, same as any other sustained frozen clock.
         state.onCommercial = true;
-        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (frozen ${Math.round(frozen / 1000)}s)`);
+        state.lastPlayAtBreakStart = sit.lastPlay || null;
+        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (frozen ${Math.round(frozen / 1000)}s${sit.isTimeout ? ", started as timeout" : ""})`);
       } else {
         console.log(`[${key}] ${sit.label} frozen ${Math.round(frozen / 1000)}s / ${threshold / 1000}s`);
       }
@@ -602,6 +765,7 @@ function processGame(session, game) {
       state.lastClock = sit.clock;
       state.lastChangedAt = now;
       state.onCommercial = sit.intermission;
+      state.lastPlayAtBreakStart = sit.intermission ? sit.lastPlay : null;
       console.log(`[${key}] NHL tracking — Period ${sit.period}, ${sit.clock} (detail: "${sit.detail}") intermission=${sit.intermission}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.intermission);
       return;
@@ -610,9 +774,6 @@ function processGame(session, game) {
     const periodChanged = sit.period !== state.lastPeriod;
     const clockMoved = sit.clock !== state.lastClock;
     const detailLower = (sit.detail || "").toLowerCase();
-
-    // Only treat as commercial if ESPN explicitly says "timeout"
-    // Reviews, challenges, penalties etc. are excluded to avoid false positives
     const isExplicitTimeout = detailLower.includes("timeout");
 
     if (periodChanged || clockMoved) {
@@ -620,7 +781,7 @@ function processGame(session, game) {
         const msg = periodChanged
           ? `${game.fullName || game.nickname} is back — ${ord(sit.period)} period starting.`
           : `${game.fullName || game.nickname} is back live — ${sit.clock} left in the ${ord(sit.period)}.`;
-        notify(ntfyTopic, "Game is back!", msg);
+        notify(ntfyTopic, "Game is back!", withRecap(msg, recapIfNew(sit, state)));
         console.log(`[${key}] NHL: BACK LIVE`);
       }
       state.onCommercial = false;
@@ -629,12 +790,21 @@ function processGame(session, game) {
       state.lastChangedAt = now;
       console.log(`[${key}] ${sit.label} (detail: "${sit.detail}")`);
     } else {
-      if (sit.intermission && !state.onCommercial) {
+      const frozen = now - state.lastChangedAt;
+      if (sit.isReview) {
+        // Reviews rarely go to commercial — never let this count toward a break
+        state.lastChangedAt = now;
+        console.log(`[${key}] ${sit.label} — excluded from break threshold (under review)`);
+      } else if (sit.intermission && !state.onCommercial) {
+        // Between-period intermissions are always a real break — instant, no threshold needed
         state.onCommercial = true;
+        state.lastPlayAtBreakStart = sit.lastPlay || null;
         console.log(`[${key}] NHL: Intermission`);
-      } else if (isExplicitTimeout && !state.onCommercial) {
+      } else if (isExplicitTimeout && !state.onCommercial && frozen >= NHL_TIMEOUT_ESCALATE_MS) {
+        // A quick timeout resolves before this — only a sustained one escalates
         state.onCommercial = true;
-        console.log(`[${key}] NHL: Timeout detected — "${sit.detail}"`);
+        state.lastPlayAtBreakStart = sit.lastPlay || null;
+        console.log(`[${key}] NHL: Timeout escalated to real break after ${Math.round(frozen / 1000)}s`);
       } else {
         console.log(`[${key}] ${sit.label} (detail: "${sit.detail}") — no trigger`);
       }
@@ -648,6 +818,7 @@ function processGame(session, game) {
       state.lastDetail = sit.detail;
       state.lastPeriod = sit.period;
       state.onCommercial = sit.isHalftime;
+      state.lastPlayAtBreakStart = sit.isHalftime ? sit.lastPlay : null;
       console.log(`[${key}] Soccer tracking — ${sit.label} halftime=${sit.isHalftime}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.isHalftime);
       return;
@@ -657,10 +828,11 @@ function processGame(session, game) {
       console.log(`[${key}] Soccer: "${state.lastDetail}" -> "${sit.detail}"`);
       if (sit.isHalftime && !state.onCommercial) {
         state.onCommercial = true;
+        state.lastPlayAtBreakStart = sit.lastPlay || null;
         console.log(`[${key}] Soccer: Halftime`);
       } else if (!sit.isHalftime && state.onCommercial) {
         const halfLabel = sit.period === 2 ? "2nd half" : sit.period >= 3 ? "extra time" : "2nd half";
-        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${halfLabel} starting!`);
+        notify(ntfyTopic, "Game is back!", withRecap(`${game.fullName || game.nickname} is back — ${halfLabel} starting!`, recapIfNew(sit, state)));
         state.onCommercial = false;
         console.log(`[${key}] Soccer: BACK LIVE`);
       }
@@ -671,7 +843,10 @@ function processGame(session, game) {
     }
   }
 
-  game.status = state.onCommercial ? "commercial" : "live";
+  if (state.onCommercial) game.status = "commercial";
+  else if (sit.isReview) game.status = "review";
+  else if (sit.isTimeout) game.status = "timeout";
+  else game.status = "live";
 
   // ---- SPOTIFY transition detection ----
   if (session.spotifyEnabled) {
@@ -712,14 +887,17 @@ async function pollAll() {
 
     // Flatten every (session, game) that needs checking this cycle
     const tasks = [];
+    let anyExpired = false;
     for (const [id, session] of Object.entries(sessions)) {
       if (session.expiresAt && Date.now() > session.expiresAt) {
         console.log(`[${id}] Session expired — stopping`);
         delete sessions[id];
+        anyExpired = true;
         continue;
       }
       for (const game of session.games) tasks.push({ id, session, game });
     }
+    if (anyExpired) saveSessions();
 
     // Process every game in parallel rather than one-at-a-time, so total
     // cycle time no longer scales with the number of games/sessions.
@@ -760,7 +938,9 @@ async function pollAll() {
         const status = comp?.status;
         const rawSit = comp?.situation;
         const espnState = status?.type?.state; // "pre" | "in" | "post"
-        console.log(`[${game.nickname}] state=${espnState} detail="${status?.type?.shortDetail}" outs=${rawSit?.outs ?? "n/a"}`);
+        const rawLastPlayCheck = rawSit?.lastPlay;
+        const lastPlayPreview = rawLastPlayCheck?.text || (typeof rawLastPlayCheck === "string" ? rawLastPlayCheck : null);
+        console.log(`[${game.nickname}] state=${espnState} detail="${status?.type?.shortDetail}" outs=${rawSit?.outs ?? "n/a"} lastPlay=${lastPlayPreview ? `"${lastPlayPreview}"` : "MISSING"}`);
 
         if (espnState === "post") {
           // Game finished — ESPN keeps it listed (state=post) rather than
@@ -1008,6 +1188,7 @@ http.createServer(async (req, res) => {
       states: {}, spotifyEnabled: hasSpotify,
       expiresAt: Date.now() + SESSION_TTL_MS
     };
+    saveSessions();
     notify(sessionId, "BackLive is watching!", `Tracking: ${games.join(", ")} (auto-stops in 8h)`);
     console.log(`[${sessionId}] Started: ${games.join(", ")} sports=${JSON.stringify(gameSports)} spotify=${hasSpotify}`);
     jsonRes(res, 200, { ok: true, spotifyConnected: !!spotifyTokens[sessionId], spotifyEnabled: hasSpotify });
@@ -1028,6 +1209,7 @@ http.createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname === "/stop") {
     const { ntfyTopic } = await readBody(req);
     delete sessions[ntfyTopic];
+    saveSessions();
     jsonRes(res, 200, { ok: true });
     return;
   }
