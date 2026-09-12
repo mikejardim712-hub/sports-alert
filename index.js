@@ -463,8 +463,22 @@ function ord(n) {
 // Only include a recap if the last-known play actually CHANGED since the break
 // started — otherwise ESPN's lastPlay field is just showing the pre-break play,
 // which would make the recap pointless (or worse, misleading).
+// ESPN sometimes records the period/inning boundary itself as a "play"
+// (e.g. "End of the 3rd Quarter", "Start of the 4th") — that's not a real
+// missed moment, just administrative text describing the stoppage, so it
+// should never show up in a recap.
+function isAdministrativeText(text) {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  return t.includes("end of") || t.includes("start of") || t.includes("halftime") ||
+         t.includes("timeout") || t.includes("intermission") || t.includes("mid ") ||
+         /^end /.test(t) || /^start /.test(t);
+}
 function recapIfNew(sit, state) {
-  if (sit?.lastPlay && sit.lastPlay !== state.lastPlayAtBreakStart) return sit.lastPlay;
+  if (sit?.lastPlay && sit.lastPlay !== state.lastPlayAtBreakStart && !isAdministrativeText(sit.lastPlay)) {
+    // Strip a leading game-clock timestamp like "(12:36) " — not useful in a notification
+    return sit.lastPlay.replace(/^\(\d{1,2}:\d{2}\)\s*/, "");
+  }
   return null;
 }
 function withRecap(baseMsg, recapText) {
@@ -776,7 +790,17 @@ function processGame(session, game) {
     const detailLower = (sit.detail || "").toLowerCase();
     const isExplicitTimeout = detailLower.includes("timeout");
 
-    if (periodChanged || clockMoved) {
+    // Check intermission entry FIRST, before clock-moved logic — otherwise the
+    // clock hitting 0:00 (which itself counts as "the clock moved") steals this
+    // poll and delays intermission detection by a full extra cycle.
+    if (sit.intermission && !state.onCommercial) {
+      state.onCommercial = true;
+      state.lastPlayAtBreakStart = sit.lastPlay || null;
+      state.lastClock = sit.clock;
+      state.lastPeriod = sit.period;
+      state.lastChangedAt = now;
+      console.log(`[${key}] NHL: Intermission (instant)`);
+    } else if (periodChanged || clockMoved) {
       if (state.onCommercial) {
         const msg = periodChanged
           ? `${game.fullName || game.nickname} is back — ${ord(sit.period)} period starting.`
@@ -795,11 +819,6 @@ function processGame(session, game) {
         // Reviews rarely go to commercial — never let this count toward a break
         state.lastChangedAt = now;
         console.log(`[${key}] ${sit.label} — excluded from break threshold (under review)`);
-      } else if (sit.intermission && !state.onCommercial) {
-        // Between-period intermissions are always a real break — instant, no threshold needed
-        state.onCommercial = true;
-        state.lastPlayAtBreakStart = sit.lastPlay || null;
-        console.log(`[${key}] NHL: Intermission`);
       } else if (isExplicitTimeout && !state.onCommercial && frozen >= NHL_TIMEOUT_ESCALATE_MS) {
         // A quick timeout resolves before this — only a sustained one escalates
         state.onCommercial = true;
