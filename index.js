@@ -458,33 +458,6 @@ function ord(n) {
   return n === 1 ? "1st" : n === 2 ? "2nd" : n === 3 ? "3rd" : `${n}th`;
 }
 
-// Appends a quick recap of the most recent play, if ESPN's data included one —
-// safety net in case the notification lands just after a play already happened.
-// Only include a recap if the last-known play actually CHANGED since the break
-// started — otherwise ESPN's lastPlay field is just showing the pre-break play,
-// which would make the recap pointless (or worse, misleading).
-// ESPN sometimes records the period/inning boundary itself as a "play"
-// (e.g. "End of the 3rd Quarter", "Start of the 4th") — that's not a real
-// missed moment, just administrative text describing the stoppage, so it
-// should never show up in a recap.
-function isAdministrativeText(text) {
-  if (!text) return false;
-  const t = text.toLowerCase();
-  return t.includes("end of") || t.includes("start of") || t.includes("halftime") ||
-         t.includes("timeout") || t.includes("intermission") || t.includes("mid ") ||
-         /^end /.test(t) || /^start /.test(t);
-}
-function recapIfNew(sit, state) {
-  if (sit?.lastPlay && sit.lastPlay !== state.lastPlayAtBreakStart && !isAdministrativeText(sit.lastPlay)) {
-    // Strip a leading game-clock timestamp like "(12:36) " — not useful in a notification
-    return sit.lastPlay.replace(/^\(\d{1,2}:\d{2}\)\s*/, "");
-  }
-  return null;
-}
-function withRecap(baseMsg, recapText) {
-  return recapText ? `${baseMsg} You missed: ${recapText}` : baseMsg;
-}
-
 // ============================================================
 //  SITUATION EXTRACTORS
 // ============================================================
@@ -495,13 +468,6 @@ function getSituation(event, sport) {
 
   const detail = status?.type?.shortDetail || "";
   const detailLower = detail.toLowerCase();
-  // ESPN's scoreboard often includes a short description of the most recent
-  // play — used to give a quick recap in "Game is back!" notifications in
-  // case the notification arrives just after a play has already happened.
-  // Handles both the documented shape (lastPlay.text) and the case where
-  // ESPN occasionally returns it as a bare string instead.
-  const rawLastPlay = comp?.situation?.lastPlay;
-  const lastPlay = (rawLastPlay?.text) || (typeof rawLastPlay === "string" ? rawLastPlay : null);
 
   if (sport === "baseball/mlb") {
     const sit = comp?.situation;
@@ -512,7 +478,7 @@ function getSituation(event, sport) {
     const isDelay = detailLower.includes("delay") || detailLower.includes("suspend") || detailLower.includes("postpone");
     const half = detailLower.includes("bot") ? "bottom" : "top";
     const label = isDelay ? "Game delayed" : isEnd ? `End of ${ord(inning)}` : isMidInning ? `Mid ${ord(inning)}` : `${half === "top" ? "Top" : "Bot"} ${ord(inning)}, ${outs ?? 0} outs`;
-    return { sport: "mlb", inning, half, outs, isEnd: isEnd || isDelay, isDelay, isMidInning, isTimeout: isMidInning, detail, label, lastPlay };
+    return { sport: "mlb", inning, half, outs, isEnd: isEnd || isDelay, isDelay, isMidInning, isTimeout: isMidInning, detail, label };
   }
   if (sport === "basketball/nba" || sport === "basketball/mens-college-basketball") {
     const clock = status.displayClock || "0:00";
@@ -528,7 +494,7 @@ function getSituation(event, sport) {
     // was live, even if our clock/detail parsing missed the exact moment.
     const competitors = comp?.competitors || [];
     const score = competitors.length >= 2 ? competitors.map(c => c.score).join("-") : null;
-    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, isTimeout, isReview, detail, label, lastPlay, score };
+    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, isTimeout, isReview, detail, label, score };
   }
   if (sport === "football/nfl" || sport === "football/college-football") {
     const clock = status.displayClock || "0:00";
@@ -539,14 +505,14 @@ function getSituation(event, sport) {
     const isTimeout = detailLower.includes("timeout");
     const isReview = detailLower.includes("review") || detailLower.includes("challenge");
     const label = isHalftime ? "Halftime" : isEndOfPeriod ? `End of ${ord(period)}` : isTimeout ? `Timeout, ${ord(period)} qtr` : isReview ? `Under review, ${ord(period)} qtr` : `${ord(period)} qtr, ${clock}`;
-    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, isTimeout, isReview, detail, label, lastPlay };
+    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, isTimeout, isReview, detail, label };
   }
   if (sport === "hockey/nhl") {
     const period = status.period || 1;
     const clock = status.displayClock || "0:00";
     const intermission = detailLower.includes("end") || detailLower.includes("intermission") || clock === "0:00";
     const isReview = detailLower.includes("review") || detailLower.includes("challenge");
-    return { sport: "nhl", period, clock, intermission, isReview, lastPlay, label: `Period ${period}, ${clock}` };
+    return { sport: "nhl", period, clock, intermission, isReview, label: `Period ${period}, ${clock}` };
   }
   if (sport === "soccer/fifa.world") {
     const clock = status.displayClock || "0:00";
@@ -556,7 +522,7 @@ function getSituation(event, sport) {
     const isReview = detailLower.includes("var") || detailLower.includes("review");
     const half = period === 1 ? "1st Half" : period === 2 ? "2nd Half" : period === 3 ? "ET 1st" : "ET 2nd";
     const label = (isHalftime || isETHalftime) ? "Halftime" : isReview ? `VAR review, ${half}` : `${half}, ${clock}`;
-    return { sport: "soccer", period, clock, isHalftime: isHalftime || isETHalftime, isReview, detail, label, lastPlay };
+    return { sport: "soccer", period, clock, isHalftime: isHalftime || isETHalftime, isReview, detail, label };
   }
   return null;
 }
@@ -633,7 +599,6 @@ function processGame(session, game) {
       state.lastDetail = sit.detail;
       state.lastChangedAt = now;
       state.onCommercial = sit.isEnd;
-      state.lastPlayAtBreakStart = sit.isEnd ? sit.lastPlay : null;
       console.log(`[${key}] MLB tracking — ${sit.detail} commercial=${sit.isEnd}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.isEnd);
       return;
@@ -644,12 +609,12 @@ function processGame(session, game) {
         // Full-inning break (bottom of an inning just ended) — always a real
         // break, instant, same as before.
         state.onCommercial = true;
-        state.lastPlayAtBreakStart = sit.lastPlay || null;
         console.log(`[${key}] MLB: Commercial${sit.isDelay ? " (delay)" : ""}`);
       } else if (!sit.isEnd && !sit.isMidInning && state.onCommercial) {
         // Resuming play — whether this was a full-inning break or a mid-inning
         // break that had escalated below — fires the same way either way.
-        notify(ntfyTopic, "Game is back!", withRecap(`${game.fullName || game.nickname} is back — ${sit.half === "top" ? "Top" : "Bottom"} of the ${ord(sit.inning)} starting.`, recapIfNew(sit, state)));
+        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${sit.half === "top" ? "Top" : "Bottom"} of the ${ord(sit.inning)} starting.`);
+
         state.onCommercial = false;
         console.log(`[${key}] MLB: BACK LIVE`);
       }
@@ -661,7 +626,6 @@ function processGame(session, game) {
       const frozen = now - state.lastChangedAt;
       if (frozen >= MID_INNING_ESCALATE_MS) {
         state.onCommercial = true;
-        state.lastPlayAtBreakStart = sit.lastPlay || null;
         console.log(`[${key}] MLB: Mid-inning break escalated to real break after ${Math.round(frozen / 1000)}s`);
       } else {
         console.log(`[${key}] ${sit.label} — mid-inning, ${Math.round(frozen / 1000)}s / ${MID_INNING_ESCALATE_MS / 1000}s`);
@@ -690,7 +654,6 @@ function processGame(session, game) {
       state.lastDetail = sit.detail;
       state.lastChangedAt = now;
       state.onCommercial = isBreakSignal || false;
-      state.lastPlayAtBreakStart = state.onCommercial ? sit.lastPlay : null;
       if (isBasketball) state.lastScore = sit.score;
       console.log(`[${key}] ${sit.sport.toUpperCase()} tracking — ${sit.label} commercial=${state.onCommercial}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, state.onCommercial);
@@ -703,7 +666,8 @@ function processGame(session, game) {
     // were never directly observed (e.g. a timeout ending, one possession
     // happening, and another stoppage starting, all inside 5 seconds).
     if (isBasketball && state.onCommercial && sit.score && state.lastScore && sit.score !== state.lastScore) {
-      notify(ntfyTopic, "Game is back!", withRecap(`${game.fullName || game.nickname} is back — score is now ${sit.score}.`, recapIfNew(sit, state)));
+      notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — score is now ${sit.score}.`);
+
       state.onCommercial = false;
       state.lastScore = sit.score;
       state.lastDetail = sit.detail;
@@ -722,14 +686,14 @@ function processGame(session, game) {
       console.log(`[${key}] ${sit.sport.toUpperCase()}: "${state.lastDetail}" -> "${sit.detail}"`);
       if (isBreakSignal && !state.onCommercial) {
         state.onCommercial = true;
-        state.lastPlayAtBreakStart = sit.lastPlay || null;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (instant)`);
       } else if (!isBreakSignal && state.onCommercial) {
         // Detail text moving away from a break signal (e.g. "Timeout" clearing,
         // down/distance reappearing) is itself the resumption signal — don't
         // also wait for the clock to have already ticked, since that requires
         // an entire play to happen first and causes a real one-play lag.
-        notify(ntfyTopic, "Game is back!", withRecap(`${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`, recapIfNew(sit, state)));
+        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
+
         state.onCommercial = false;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE (instant)`);
       }
@@ -739,7 +703,8 @@ function processGame(session, game) {
       state.lastChangedAt = now;
     } else if (clockMoved || periodJumped) {
       if (state.onCommercial) {
-        notify(ntfyTopic, "Game is back!", withRecap(`${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`, recapIfNew(sit, state)));
+        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
+
         state.onCommercial = false;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE`);
       }
@@ -761,7 +726,6 @@ function processGame(session, game) {
         // One that drags on this long — timeout-labeled or not — is treated
         // as a real break, same as any other sustained frozen clock.
         state.onCommercial = true;
-        state.lastPlayAtBreakStart = sit.lastPlay || null;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (frozen ${Math.round(frozen / 1000)}s${sit.isTimeout ? ", started as timeout" : ""})`);
       } else {
         console.log(`[${key}] ${sit.label} frozen ${Math.round(frozen / 1000)}s / ${threshold / 1000}s`);
@@ -779,7 +743,6 @@ function processGame(session, game) {
       state.lastClock = sit.clock;
       state.lastChangedAt = now;
       state.onCommercial = sit.intermission;
-      state.lastPlayAtBreakStart = sit.intermission ? sit.lastPlay : null;
       console.log(`[${key}] NHL tracking — Period ${sit.period}, ${sit.clock} (detail: "${sit.detail}") intermission=${sit.intermission}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.intermission);
       return;
@@ -795,7 +758,6 @@ function processGame(session, game) {
     // poll and delays intermission detection by a full extra cycle.
     if (sit.intermission && !state.onCommercial) {
       state.onCommercial = true;
-      state.lastPlayAtBreakStart = sit.lastPlay || null;
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
@@ -805,7 +767,8 @@ function processGame(session, game) {
         const msg = periodChanged
           ? `${game.fullName || game.nickname} is back — ${ord(sit.period)} period starting.`
           : `${game.fullName || game.nickname} is back live — ${sit.clock} left in the ${ord(sit.period)}.`;
-        notify(ntfyTopic, "Game is back!", withRecap(msg, recapIfNew(sit, state)));
+        notify(ntfyTopic, "Game is back!", msg);
+
         console.log(`[${key}] NHL: BACK LIVE`);
       }
       state.onCommercial = false;
@@ -822,7 +785,6 @@ function processGame(session, game) {
       } else if (isExplicitTimeout && !state.onCommercial && frozen >= NHL_TIMEOUT_ESCALATE_MS) {
         // A quick timeout resolves before this — only a sustained one escalates
         state.onCommercial = true;
-        state.lastPlayAtBreakStart = sit.lastPlay || null;
         console.log(`[${key}] NHL: Timeout escalated to real break after ${Math.round(frozen / 1000)}s`);
       } else {
         console.log(`[${key}] ${sit.label} (detail: "${sit.detail}") — no trigger`);
@@ -837,7 +799,6 @@ function processGame(session, game) {
       state.lastDetail = sit.detail;
       state.lastPeriod = sit.period;
       state.onCommercial = sit.isHalftime;
-      state.lastPlayAtBreakStart = sit.isHalftime ? sit.lastPlay : null;
       console.log(`[${key}] Soccer tracking — ${sit.label} halftime=${sit.isHalftime}`);
       if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.isHalftime);
       return;
@@ -847,11 +808,11 @@ function processGame(session, game) {
       console.log(`[${key}] Soccer: "${state.lastDetail}" -> "${sit.detail}"`);
       if (sit.isHalftime && !state.onCommercial) {
         state.onCommercial = true;
-        state.lastPlayAtBreakStart = sit.lastPlay || null;
         console.log(`[${key}] Soccer: Halftime`);
       } else if (!sit.isHalftime && state.onCommercial) {
         const halfLabel = sit.period === 2 ? "2nd half" : sit.period >= 3 ? "extra time" : "2nd half";
-        notify(ntfyTopic, "Game is back!", withRecap(`${game.fullName || game.nickname} is back — ${halfLabel} starting!`, recapIfNew(sit, state)));
+        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${halfLabel} starting!`);
+
         state.onCommercial = false;
         console.log(`[${key}] Soccer: BACK LIVE`);
       }
@@ -957,9 +918,7 @@ async function pollAll() {
         const status = comp?.status;
         const rawSit = comp?.situation;
         const espnState = status?.type?.state; // "pre" | "in" | "post"
-        const rawLastPlayCheck = rawSit?.lastPlay;
-        const lastPlayPreview = rawLastPlayCheck?.text || (typeof rawLastPlayCheck === "string" ? rawLastPlayCheck : null);
-        console.log(`[${game.nickname}] state=${espnState} detail="${status?.type?.shortDetail}" outs=${rawSit?.outs ?? "n/a"} lastPlay=${lastPlayPreview ? `"${lastPlayPreview}"` : "MISSING"}`);
+        console.log(`[${game.nickname}] state=${espnState} detail="${status?.type?.shortDetail}" outs=${rawSit?.outs ?? "n/a"}`);
 
         if (espnState === "post") {
           // Game finished — ESPN keeps it listed (state=post) rather than
