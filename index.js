@@ -458,6 +458,72 @@ function ord(n) {
   return n === 1 ? "1st" : n === 2 ? "2nd" : n === 3 ? "3rd" : `${n}th`;
 }
 
+// Extracts a quick-glance header (score, clock, period, down/distance,
+// timeouts) from ESPN's summary-endpoint response, for the live plays screen.
+// ESPN's summary shape varies by sport, so every field here is best-effort —
+// each one is tried against several plausible locations and falls back to
+// null rather than guessing, so a missing field just doesn't render instead
+// of showing something wrong. Logs exactly which path matched (or dumps the
+// real available keys when none did) so a live test tells us precisely what
+// to fix, without another round of guessing.
+function extractGameHeader(data, logTag) {
+  const headerComp = data?.header?.competitions?.[0];
+  const bareComp = data?.competitions?.[0]; // some sports/endpoints put situation here instead
+  const competitors = headerComp?.competitors || bareComp?.competitors || [];
+  const status = headerComp?.status || bareComp?.status;
+
+  const score = competitors.length >= 2
+    ? competitors
+        .slice()
+        .sort((a, b) => (a.homeAway === "away" ? -1 : 1)) // away first, then home — typical broadcast order
+        .map(c => `${c.team?.abbreviation || c.team?.shortDisplayName || c.team?.displayName || ""} ${c.score ?? ""}`.trim())
+        .join("  —  ")
+    : null;
+
+  const clock = status?.displayClock || null;
+  const period = status?.period || null;
+  const periodLabel = period ? ord(period) : null;
+  console.log(`[header:${logTag}] score=${score ? `"${score}"` : "MISSING"} clock=${clock || "MISSING"} period=${period ?? "MISSING"}`);
+
+  // Football-specific: down & distance — try several plausible locations
+  const situationCandidates = [
+    { path: "data.situation", obj: data?.situation },
+    { path: "headerComp.situation", obj: headerComp?.situation },
+    { path: "bareComp.situation", obj: bareComp?.situation },
+    { path: "data.drives.current.situation", obj: data?.drives?.current?.situation },
+  ];
+  let downDistance = null, downDistanceSource = null;
+  for (const c of situationCandidates) {
+    if (!c.obj) continue;
+    const val = c.obj.downDistanceText || c.obj.shortDownDistanceText;
+    if (val) { downDistance = val; downDistanceSource = c.path; break; }
+  }
+  if (downDistance) {
+    console.log(`[header:${logTag}] downDistance="${downDistance}" via ${downDistanceSource}`);
+  } else {
+    const availableKeys = situationCandidates.filter(c => c.obj).map(c => `${c.path}: [${Object.keys(c.obj).join(", ")}]`);
+    console.log(`[header:${logTag}] downDistance MISSING. Available situation objects and their keys: ${availableKeys.length ? availableKeys.join(" | ") : "none found at all"}`);
+  }
+
+  // Timeouts remaining — field name/location varies by sport and isn't
+  // consistently documented; try the most plausible spots.
+  const homeTeam = competitors.find(c => c.homeAway === "home");
+  const awayTeam = competitors.find(c => c.homeAway === "away");
+  const situation = situationCandidates.find(c => c.obj)?.obj;
+  const homeTimeouts = homeTeam?.timeouts ?? situation?.homeTimeouts ?? situation?.homeTeamTimeouts ?? null;
+  const awayTimeouts = awayTeam?.timeouts ?? situation?.awayTimeouts ?? situation?.awayTeamTimeouts ?? null;
+  const timeouts = (homeTimeouts != null && awayTimeouts != null)
+    ? `${awayTeam?.team?.abbreviation || "Away"} ${awayTimeouts} — ${homeTeam?.team?.abbreviation || "Home"} ${homeTimeouts} timeouts`
+    : null;
+  if (timeouts) {
+    console.log(`[header:${logTag}] timeouts="${timeouts}"`);
+  } else {
+    const teamKeys = competitors.map(c => `${c.homeAway}: [${Object.keys(c).join(", ")}]`);
+    console.log(`[header:${logTag}] timeouts MISSING. Competitor object keys: ${teamKeys.join(" | ") || "no competitors found"}`);
+  }
+  return { score, clock, period, periodLabel, downDistance, timeouts };
+}
+
 // ============================================================
 //  SITUATION EXTRACTORS
 // ============================================================
@@ -1181,6 +1247,50 @@ http.createServer(async (req, res) => {
       games: s.games.map(g => ({ nickname: g.nickname, fullName: g.fullName, status: g.status, detail: g.detail })),
       spotifyConnected: !!spotifyTokens[id], spotifyEnabled: s.spotifyEnabled, expiresAt: s.expiresAt
     });
+    return;
+  }
+
+  // Pull-based only — the user has to actively request this, it is never
+  // pushed. That's the whole point: no spoiler risk, since nothing shows up
+  // unless you've chosen to look at this exact moment.
+  if (req.method === "GET" && url.pathname === "/plays") {
+    const id = url.searchParams.get("session");
+    const gameKey = url.searchParams.get("game"); // which tracked game, if more than one
+    const s = sessions[id];
+    if (!s) { jsonRes(res, 404, { error: "No session" }); return; }
+    const game = gameKey ? s.games.find(g => g.nickname === gameKey) : s.games[0];
+    if (!game) { jsonRes(res, 404, { error: "Game not found in session" }); return; }
+    if (!game.espnId) { jsonRes(res, 200, { plays: [], fullName: game.fullName, note: "Game not locked yet" }); return; }
+    try {
+      const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${game.sport}/summary?event=${game.espnId}`);
+      if (!r.ok) throw new Error(`ESPN ${r.status}`);
+      const data = await r.json();
+      // ESPN's summary endpoint structures plays differently by sport — try a
+      // flat "plays" array first (common for basketball/baseball/hockey/soccer),
+      // fall back to football's drive-nested structure if that's empty.
+      let rawPlays = Array.isArray(data.plays) ? data.plays : [];
+      let playsSource = "data.plays (flat)";
+      if (rawPlays.length === 0 && data.drives?.previous) {
+        rawPlays = data.drives.previous.flatMap(d => d.plays || []);
+        playsSource = "data.drives.previous[].plays (nested)";
+      }
+      const plays = rawPlays
+        .map(p => ({
+          text: p.text || p.shortText || "",
+          clock: p.clock?.displayValue || null,
+          period: p.period?.number || null,
+          scoringPlay: !!p.scoringPlay
+        }))
+        .filter(p => p.text)
+        .slice(-30)
+        .reverse(); // most recent first
+      console.log(`[plays:${game.nickname}] Found ${rawPlays.length} raw plays via ${playsSource}, ${plays.length} after filtering`);
+      const header = extractGameHeader(data, game.nickname);
+      jsonRes(res, 200, { plays, fullName: game.fullName, header });
+    } catch (e) {
+      console.error(`[plays] ${game.nickname}:`, e.message);
+      jsonRes(res, 500, { error: e.message, plays: [] });
+    }
     return;
   }
 
