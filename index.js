@@ -186,8 +186,8 @@ setInterval(async () => {
   }
 }, 45 * 60 * 1000);
 
-async function spotifyAction(ntfyTopic, action) {
-  // action = "pause" or "play"
+async function spotifyAction(ntfyTopic, action, method = "PUT") {
+  // action = "pause", "play", "next", or "previous"
   const token = await getSpotifyToken(ntfyTopic);
   if (!token) {
     console.log(`[spotify:${ntfyTopic}] No token — skipping ${action}`);
@@ -195,7 +195,7 @@ async function spotifyAction(ntfyTopic, action) {
   }
   try {
     const r = await fetch(`https://api.spotify.com/v1/me/player/${action}`, {
-      method: "PUT",
+      method,
       headers: { "Authorization": `Bearer ${token}` }
     });
     if (r.status === 204) {
@@ -206,7 +206,7 @@ async function spotifyAction(ntfyTopic, action) {
       const newToken = await refreshSpotifyToken(ntfyTopic);
       if (newToken) {
         const retry = await fetch(`https://api.spotify.com/v1/me/player/${action}`, {
-          method: "PUT",
+          method,
           headers: { "Authorization": `Bearer ${newToken}` }
         });
         console.log(`[spotify:${ntfyTopic}] ${action} retry — status ${retry.status}`);
@@ -221,8 +221,53 @@ async function spotifyAction(ntfyTopic, action) {
   } catch (e) { console.error(`[spotify:${ntfyTopic}] ${action} error:`, e.message); }
 }
 
-function spotifyPause(ntfyTopic) { return spotifyAction(ntfyTopic, "pause"); }
-function spotifyResume(ntfyTopic) { return spotifyAction(ntfyTopic, "play"); }
+function spotifyPause(ntfyTopic) { return spotifyAction(ntfyTopic, "pause", "PUT"); }
+function spotifyResume(ntfyTopic) { return spotifyAction(ntfyTopic, "play", "PUT"); }
+function spotifyNext(ntfyTopic) { return spotifyAction(ntfyTopic, "next", "POST"); }
+function spotifyPrevious(ntfyTopic) { return spotifyAction(ntfyTopic, "previous", "POST"); }
+
+// Fetches what's currently playing — used for the "now playing" mini player.
+// Read-only, no side effects, safe to poll periodically.
+async function getCurrentlyPlaying(ntfyTopic) {
+  const token = await getSpotifyToken(ntfyTopic);
+  if (!token) return { connected: false };
+  try {
+    const r = await fetch("https://api.spotify.com/v1/me/player/currently-playing", {
+      headers: { "Authorization": `Bearer ${token}` }
+    });
+    if (r.status === 204) return { connected: true, isPlaying: false, track: null }; // nothing playing
+    if (r.status === 401) {
+      const newToken = await refreshSpotifyToken(ntfyTopic);
+      if (!newToken) return { connected: false };
+      const retry = await fetch("https://api.spotify.com/v1/me/player/currently-playing", {
+        headers: { "Authorization": `Bearer ${newToken}` }
+      });
+      if (retry.status === 204 || !retry.ok) return { connected: true, isPlaying: false, track: null };
+      return parseCurrentlyPlaying(await retry.json());
+    }
+    if (!r.ok) return { connected: true, isPlaying: false, track: null };
+    return parseCurrentlyPlaying(await r.json());
+  } catch (e) {
+    console.error(`[spotify:${ntfyTopic}] now-playing error:`, e.message);
+    return { connected: false };
+  }
+}
+
+function parseCurrentlyPlaying(data) {
+  if (!data || !data.item) return { connected: true, isPlaying: false, track: null };
+  return {
+    connected: true,
+    isPlaying: !!data.is_playing,
+    track: {
+      name: data.item.name,
+      artist: (data.item.artists || []).map(a => a.name).join(", "),
+      album: data.item.album?.name || null,
+      albumArt: data.item.album?.images?.[0]?.url || null,
+      progressMs: data.progress_ms || 0,
+      durationMs: data.item.duration_ms || 0
+    }
+  };
+}
 
 function applySpotifyNow(ntfyTopic, onCommercial) {
   if (onCommercial) spotifyResume(ntfyTopic);
@@ -666,7 +711,10 @@ function processGame(session, game) {
       state.lastChangedAt = now;
       state.onCommercial = sit.isEnd;
       console.log(`[${key}] MLB tracking — ${sit.detail} commercial=${sit.isEnd}`);
-      if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.isEnd);
+      // Broader guess for the one-time startup Spotify sync — a visible
+      // mid-inning break counts too, even though it's not yet confirmed as
+      // a real commercial for badge/notification purposes.
+      if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.isEnd || sit.isMidInning);
       return;
     }
     if (sit.detail !== state.lastDetail) {
@@ -722,7 +770,13 @@ function processGame(session, game) {
       state.onCommercial = isBreakSignal || false;
       if (isBasketball) state.lastScore = sit.score;
       console.log(`[${key}] ${sit.sport.toUpperCase()} tracking — ${sit.label} commercial=${state.onCommercial}`);
-      if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, state.onCommercial);
+      // For the one-time startup Spotify sync specifically, use a more
+      // permissive guess than the badge/notification logic — if you're
+      // already mid-timeout or under review right when you start watching,
+      // treat that as "probably not live right now" rather than defaulting
+      // to live and incorrectly pausing music that should be playing.
+      const spotifyInitialGuess = isBreakSignal || sit.isTimeout || sit.isReview;
+      if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, spotifyInitialGuess);
       return;
     }
 
@@ -810,7 +864,12 @@ function processGame(session, game) {
       state.lastChangedAt = now;
       state.onCommercial = sit.intermission;
       console.log(`[${key}] NHL tracking — Period ${sit.period}, ${sit.clock} (detail: "${sit.detail}") intermission=${sit.intermission}`);
-      if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.intermission);
+      // Broader guess for the one-time startup Spotify sync — a currently
+      // visible timeout or review counts too, even though those aren't yet
+      // confirmed as a real break for badge/notification purposes.
+      const nhlInitDetailLower = (sit.detail || "").toLowerCase();
+      const spotifyInitialGuess = sit.intermission || sit.isReview || nhlInitDetailLower.includes("timeout");
+      if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, spotifyInitialGuess);
       return;
     }
 
@@ -866,7 +925,10 @@ function processGame(session, game) {
       state.lastPeriod = sit.period;
       state.onCommercial = sit.isHalftime;
       console.log(`[${key}] Soccer tracking — ${sit.label} halftime=${sit.isHalftime}`);
-      if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.isHalftime);
+      // Broader guess for the one-time startup Spotify sync — a VAR review
+      // already showing counts too, even though it's not treated as a real
+      // break for badge/notification purposes.
+      if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.isHalftime || sit.isReview);
       return;
     }
     const changed = sit.detail !== state.lastDetail || sit.period !== state.lastPeriod;
@@ -902,6 +964,27 @@ function processGame(session, game) {
     } else if (wasOnCommercial && !state.onCommercial) {
       console.log(`[${key}] Spotify: pausing music (game came back live)`);
       spotifyPause(ntfyTopic);
+    }
+
+    // Beyond reacting to transitions WE detect, periodically verify Spotify's
+    // actual playback state matches what it should be right now. Catches the
+    // case where you start playing music mid-game with no break/live
+    // transition having just happened — without this, it would sit out of
+    // sync until the next real transition, which could be minutes away.
+    // Throttled to avoid hammering Spotify's API every single poll.
+    const nowTs = Date.now();
+    const SPOTIFY_CHECK_INTERVAL_MS = 15000;
+    if (!state.lastSpotifyCheckAt || nowTs - state.lastSpotifyCheckAt >= SPOTIFY_CHECK_INTERVAL_MS) {
+      state.lastSpotifyCheckAt = nowTs;
+      const desiredPlaying = state.onCommercial; // should play during a break, pause while live
+      getCurrentlyPlaying(ntfyTopic).then(info => {
+        if (!info.connected) return;
+        if (info.isPlaying !== desiredPlaying) {
+          console.log(`[${key}] Spotify: correcting out-of-sync playback (isPlaying=${info.isPlaying}, should be ${desiredPlaying})`);
+          if (desiredPlaying) spotifyResume(ntfyTopic);
+          else spotifyPause(ntfyTopic);
+        }
+      }).catch(() => {});
     }
   }
 }
@@ -1340,7 +1423,7 @@ http.createServer(async (req, res) => {
         if (sessions[ntfyTopic]) sessions[ntfyTopic].spotifyEnabled = true;
         console.log(`[spotify:${ntfyTopic}] Connected & saved (platform=${platform || "web"})`);
         const redirectUrl = platform === "app"
-          ? "backliveapp3://spotify-connected"
+          ? "backliveapp4://spotify-connected"
           : `https://backlive.netlify.app?spotify=connected&session=${encodeURIComponent(ntfyTopic)}`;
         res.writeHead(302, { "Location": redirectUrl });
         res.end();
@@ -1352,6 +1435,26 @@ http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/spotify/status") {
     const id = url.searchParams.get("session");
     jsonRes(res, 200, { connected: !!spotifyTokens[id] });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/spotify/now-playing") {
+    const id = url.searchParams.get("session");
+    if (!id || !spotifyTokens[id]) { jsonRes(res, 200, { connected: false }); return; }
+    const info = await getCurrentlyPlaying(id);
+    jsonRes(res, 200, info);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/spotify/control") {
+    const { session: id, action } = await readBody(req);
+    if (!id || !spotifyTokens[id]) { jsonRes(res, 400, { error: "Not connected" }); return; }
+    if (action === "pause") await spotifyPause(id);
+    else if (action === "play") await spotifyResume(id);
+    else if (action === "next") await spotifyNext(id);
+    else if (action === "previous") await spotifyPrevious(id);
+    else { jsonRes(res, 400, { error: "Unknown action" }); return; }
+    jsonRes(res, 200, { ok: true });
     return;
   }
 
