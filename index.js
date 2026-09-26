@@ -1511,6 +1511,17 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/spotify/disconnect") {
+    const { session: id } = await readBody(req);
+    if (!id) { jsonRes(res, 400, { error: "Missing session" }); return; }
+    delete spotifyTokens[id];
+    saveTokens();
+    if (sessions[id]) sessions[id].spotifyEnabled = false;
+    console.log(`[spotify:${id}] Disconnected by user`);
+    jsonRes(res, 200, { ok: true });
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/spotify/now-playing") {
     const id = url.searchParams.get("session");
     if (!id || !spotifyTokens[id]) { jsonRes(res, 200, { connected: false }); return; }
