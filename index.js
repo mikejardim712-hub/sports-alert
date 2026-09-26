@@ -511,11 +511,12 @@ function ord(n) {
 // of showing something wrong. Logs exactly which path matched (or dumps the
 // real available keys when none did) so a live test tells us precisely what
 // to fix, without another round of guessing.
-function extractGameHeader(data, logTag) {
+function extractGameHeader(data, logTag, sport) {
   const headerComp = data?.header?.competitions?.[0];
   const bareComp = data?.competitions?.[0]; // some sports/endpoints put situation here instead
   const competitors = headerComp?.competitors || bareComp?.competitors || [];
   const status = headerComp?.status || bareComp?.status;
+  const isBaseball = sport === "baseball/mlb";
 
   const score = competitors.length >= 2
     ? competitors
@@ -525,48 +526,104 @@ function extractGameHeader(data, logTag) {
         .join("  —  ")
     : null;
 
-  const clock = status?.displayClock || null;
+  // Baseball has no real countdown clock — ESPN just reports a static "0:00",
+  // which is meaningless to show. Skip it entirely for that sport.
+  const clock = isBaseball ? null : (status?.displayClock || null);
   const period = status?.period || null;
-  const periodLabel = period ? ord(period) : null;
-  console.log(`[header:${logTag}] score=${score ? `"${score}"` : "MISSING"} clock=${clock || "MISSING"} period=${period ?? "MISSING"}`);
-
-  // Football-specific: down & distance — try several plausible locations
-  const situationCandidates = [
-    { path: "data.situation", obj: data?.situation },
-    { path: "headerComp.situation", obj: headerComp?.situation },
-    { path: "bareComp.situation", obj: bareComp?.situation },
-    { path: "data.drives.current.situation", obj: data?.drives?.current?.situation },
-  ];
-  let downDistance = null, downDistanceSource = null;
-  for (const c of situationCandidates) {
-    if (!c.obj) continue;
-    const val = c.obj.downDistanceText || c.obj.shortDownDistanceText;
-    if (val) { downDistance = val; downDistanceSource = c.path; break; }
-  }
-  if (downDistance) {
-    console.log(`[header:${logTag}] downDistance="${downDistance}" via ${downDistanceSource}`);
+  // For baseball, prefer the fuller "Top 7th"/"Bot 7th" text over a bare
+  // ordinal, since inning half matters and a plain "7th" is ambiguous.
+  const shortDetail = status?.type?.shortDetail || "";
+  let periodLabel = null, periodLabelSource = null;
+  if (isBaseball) {
+    if (shortDetail) {
+      periodLabel = shortDetail;
+      periodLabelSource = "status.type.shortDetail";
+    } else {
+      // Fallback: try to build "Top/Bot Xth" from a structured half-inning
+      // flag, if shortDetail wasn't available on this data path.
+      const situationForHalf = data?.situation || headerComp?.situation || bareComp?.situation;
+      const isTop = situationForHalf?.isTopInning;
+      if (isTop != null && period) {
+        periodLabel = `${isTop ? "Top" : "Bot"} ${ord(period)}`;
+        periodLabelSource = "situation.isTopInning";
+      } else if (period) {
+        periodLabel = ord(period); // last resort — no half-inning info found anywhere
+        periodLabelSource = "ord(period) only, no half-inning source found";
+      }
+    }
+    console.log(`[header:${logTag}] periodLabel="${periodLabel}" via ${periodLabelSource} (raw shortDetail="${shortDetail}")`);
   } else {
-    const availableKeys = situationCandidates.filter(c => c.obj).map(c => `${c.path}: [${Object.keys(c.obj).join(", ")}]`);
-    console.log(`[header:${logTag}] downDistance MISSING. Available situation objects and their keys: ${availableKeys.length ? availableKeys.join(" | ") : "none found at all"}`);
+    periodLabel = period ? ord(period) : null;
+  }
+  console.log(`[header:${logTag}] score=${score ? `"${score}"` : "MISSING"} clock=${clock ?? "N/A (baseball)"} period=${periodLabel ?? "MISSING"}`);
+
+  let downDistance = null, timeouts = null, outsText = null, basesText = null;
+
+  if (isBaseball) {
+    // Outs and baserunners — best-effort field names based on common ESPN
+    // convention, logged either way so a live test tells us definitively.
+    const situationCandidates = [
+      { path: "data.situation", obj: data?.situation },
+      { path: "headerComp.situation", obj: headerComp?.situation },
+      { path: "bareComp.situation", obj: bareComp?.situation },
+    ];
+    const bSit = situationCandidates.find(c => c.obj)?.obj;
+    if (bSit && bSit.outs != null) {
+      outsText = `${bSit.outs} out${bSit.outs === 1 ? "" : "s"}`;
+      console.log(`[header:${logTag}] outs="${outsText}"`);
+    } else {
+      console.log(`[header:${logTag}] outs MISSING. Situation keys: ${bSit ? Object.keys(bSit).join(", ") : "no situation object found"}`);
+    }
+    if (bSit && (bSit.onFirst != null || bSit.onSecond != null || bSit.onThird != null)) {
+      const runners = [];
+      if (bSit.onFirst) runners.push("1st");
+      if (bSit.onSecond) runners.push("2nd");
+      if (bSit.onThird) runners.push("3rd");
+      basesText = runners.length ? `Runners on ${runners.join(", ")}` : "Bases empty";
+      console.log(`[header:${logTag}] bases="${basesText}"`);
+    } else {
+      console.log(`[header:${logTag}] baserunner fields MISSING. Situation keys: ${bSit ? Object.keys(bSit).join(", ") : "no situation object found"}`);
+    }
+  } else {
+    // Football-specific: down & distance — try several plausible locations
+    const situationCandidates = [
+      { path: "data.situation", obj: data?.situation },
+      { path: "headerComp.situation", obj: headerComp?.situation },
+      { path: "bareComp.situation", obj: bareComp?.situation },
+      { path: "data.drives.current.situation", obj: data?.drives?.current?.situation },
+    ];
+    let downDistanceSource = null;
+    for (const c of situationCandidates) {
+      if (!c.obj) continue;
+      const val = c.obj.downDistanceText || c.obj.shortDownDistanceText;
+      if (val) { downDistance = val; downDistanceSource = c.path; break; }
+    }
+    if (downDistance) {
+      console.log(`[header:${logTag}] downDistance="${downDistance}" via ${downDistanceSource}`);
+    } else {
+      const availableKeys = situationCandidates.filter(c => c.obj).map(c => `${c.path}: [${Object.keys(c.obj).join(", ")}]`);
+      console.log(`[header:${logTag}] downDistance MISSING. Available situation objects and their keys: ${availableKeys.length ? availableKeys.join(" | ") : "none found at all"}`);
+    }
+
+    // Timeouts remaining — field name/location varies by sport and isn't
+    // consistently documented; try the most plausible spots.
+    const homeTeam = competitors.find(c => c.homeAway === "home");
+    const awayTeam = competitors.find(c => c.homeAway === "away");
+    const situation = situationCandidates.find(c => c.obj)?.obj;
+    const homeTimeouts = homeTeam?.timeouts ?? situation?.homeTimeouts ?? situation?.homeTeamTimeouts ?? null;
+    const awayTimeouts = awayTeam?.timeouts ?? situation?.awayTimeouts ?? situation?.awayTeamTimeouts ?? null;
+    timeouts = (homeTimeouts != null && awayTimeouts != null)
+      ? `${awayTeam?.team?.abbreviation || "Away"} ${awayTimeouts} — ${homeTeam?.team?.abbreviation || "Home"} ${homeTimeouts} timeouts`
+      : null;
+    if (timeouts) {
+      console.log(`[header:${logTag}] timeouts="${timeouts}"`);
+    } else {
+      const teamKeys = competitors.map(c => `${c.homeAway}: [${Object.keys(c).join(", ")}]`);
+      console.log(`[header:${logTag}] timeouts MISSING. Competitor object keys: ${teamKeys.join(" | ") || "no competitors found"}`);
+    }
   }
 
-  // Timeouts remaining — field name/location varies by sport and isn't
-  // consistently documented; try the most plausible spots.
-  const homeTeam = competitors.find(c => c.homeAway === "home");
-  const awayTeam = competitors.find(c => c.homeAway === "away");
-  const situation = situationCandidates.find(c => c.obj)?.obj;
-  const homeTimeouts = homeTeam?.timeouts ?? situation?.homeTimeouts ?? situation?.homeTeamTimeouts ?? null;
-  const awayTimeouts = awayTeam?.timeouts ?? situation?.awayTimeouts ?? situation?.awayTeamTimeouts ?? null;
-  const timeouts = (homeTimeouts != null && awayTimeouts != null)
-    ? `${awayTeam?.team?.abbreviation || "Away"} ${awayTimeouts} — ${homeTeam?.team?.abbreviation || "Home"} ${homeTimeouts} timeouts`
-    : null;
-  if (timeouts) {
-    console.log(`[header:${logTag}] timeouts="${timeouts}"`);
-  } else {
-    const teamKeys = competitors.map(c => `${c.homeAway}: [${Object.keys(c).join(", ")}]`);
-    console.log(`[header:${logTag}] timeouts MISSING. Competitor object keys: ${teamKeys.join(" | ") || "no competitors found"}`);
-  }
-  return { score, clock, period, periodLabel, downDistance, timeouts };
+  return { score, clock, period, periodLabel, downDistance, timeouts, outsText, basesText };
 }
 
 // ============================================================
@@ -1248,6 +1305,20 @@ setTimeout(runDailyPushCheck, 30000);
 // ============================================================
 //  HTTP SERVER
 // ============================================================
+// Sport-appropriate word for a play's period — baseball uses innings, hockey
+// uses periods, football/NBA use quarters, college basketball/soccer use halves.
+function periodWordForSport(sport) {
+  switch (sport) {
+    case "baseball/mlb": return "Inning";
+    case "hockey/nhl": return "Period";
+    case "football/nfl": case "football/college-football": return "Qtr";
+    case "basketball/nba": return "Qtr";
+    case "basketball/mens-college-basketball": return "Half";
+    case "soccer/fifa.world": return "Half";
+    default: return "Period";
+  }
+}
+
 function jsonRes(res, code, data) {
   res.writeHead(code, {
     "Content-Type": "application/json",
@@ -1357,18 +1428,20 @@ http.createServer(async (req, res) => {
         rawPlays = data.drives.previous.flatMap(d => d.plays || []);
         playsSource = "data.drives.previous[].plays (nested)";
       }
+      const periodWord = periodWordForSport(game.sport);
       const plays = rawPlays
         .map(p => ({
           text: p.text || p.shortText || "",
           clock: p.clock?.displayValue || null,
           period: p.period?.number || null,
+          periodWord,
           scoringPlay: !!p.scoringPlay
         }))
         .filter(p => p.text)
         .slice(-30)
         .reverse(); // most recent first
       console.log(`[plays:${game.nickname}] Found ${rawPlays.length} raw plays via ${playsSource}, ${plays.length} after filtering`);
-      const header = extractGameHeader(data, game.nickname);
+      const header = extractGameHeader(data, game.nickname, game.sport);
       jsonRes(res, 200, { plays, fullName: game.fullName, header });
     } catch (e) {
       console.error(`[plays] ${game.nickname}:`, e.message);
