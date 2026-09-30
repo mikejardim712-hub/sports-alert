@@ -1311,32 +1311,58 @@ async function runDailyPushCheck() {
   }
 }
 
-// Target 11am Eastern Time (handles EST/EDT automatically)
+// Target 9am Eastern Time (handles EST/EDT automatically). A date guard
+// ensures redeploys/restarts never re-trigger a check that already ran
+// today — without it, every backend redeploy would fire an extra check.
+let lastDailyCheckDateStr = null;
+
+function todayEasternDateStr() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+}
+
+function runDailyPushCheckOnce() {
+  const today = todayEasternDateStr();
+  if (lastDailyCheckDateStr === today) {
+    console.log(`[daily-push] Already ran today (${today}) — skipping (likely a redeploy)`);
+    return;
+  }
+  lastDailyCheckDateStr = today;
+  runDailyPushCheck();
+}
+
 function scheduleNextCheck() {
   const now = new Date();
 
   // Get current time in Eastern timezone
   const easternNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
   const target = new Date(easternNow);
-  target.setHours(11, 0, 0, 0);
-  if (easternNow >= target) target.setDate(target.getDate() + 1); // tomorrow if past 11am today
+  target.setHours(9, 0, 0, 0);
+  if (easternNow >= target) target.setDate(target.getDate() + 1); // tomorrow if past 9am today
 
   // Convert the Eastern target time back to a real timestamp by computing the offset
   const offsetMs = now.getTime() - easternNow.getTime();
   const targetUtc = new Date(target.getTime() + offsetMs);
 
   const msUntilTarget = targetUtc.getTime() - now.getTime();
-  console.log(`[daily-push] Next 11am ET check in ${Math.round(msUntilTarget / 60000)} minutes`);
+  console.log(`[daily-push] Next 9am ET check in ${Math.round(msUntilTarget / 60000)} minutes`);
 
   setTimeout(() => {
-    runDailyPushCheck();
-    setInterval(runDailyPushCheck, 24 * 60 * 60 * 1000);
+    runDailyPushCheckOnce();
+    setInterval(runDailyPushCheckOnce, 24 * 60 * 60 * 1000);
   }, Math.max(msUntilTarget, 0));
 }
 
 scheduleNextCheck();
-// Safety net — also run shortly after startup in case server restarts mid-day
-setTimeout(runDailyPushCheck, 30000);
+// Safety net for a restart that happens mid-day, after 9am has already
+// passed — only fires if today's check genuinely hasn't run yet, so a
+// routine redeploy (common during active development) never re-triggers it.
+setTimeout(() => {
+  const easternHour = parseInt(
+    new Intl.DateTimeFormat('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }).format(new Date()),
+    10
+  ) % 24;
+  if (easternHour >= 9) runDailyPushCheckOnce();
+}, 30000);
 
 // ============================================================
 //  HTTP SERVER
