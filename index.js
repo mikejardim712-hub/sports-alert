@@ -1208,7 +1208,7 @@ function isInSeason(sport) {
     case "baseball/mlb": return m >= 3 && m <= 11;
     case "basketball/nba": return m >= 10 || m <= 6;
     case "football/nfl": return m >= 9 || m <= 1;
-    case "hockey/nhl": return m >= 10 || m <= 6;
+    case "hockey/nhl": return m >= 9 || m <= 6;
     case "football/college-football": return m >= 8 || m <= 1;
     case "basketball/mens-college-basketball": return m >= 11 || m <= 4;
     case "soccer/fifa.world": return y === 2026 && m >= 6 && m <= 7;
