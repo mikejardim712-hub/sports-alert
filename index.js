@@ -608,7 +608,9 @@ function extractGameHeader(data, logTag, sport) {
       if (bSit.onFirst) runners.push("1st");
       if (bSit.onSecond) runners.push("2nd");
       if (bSit.onThird) runners.push("3rd");
-      basesText = runners.length ? `Runners on ${runners.join(", ")}` : "Bases empty";
+      basesText = runners.length === 0 ? "Bases empty"
+        : runners.length === 1 ? `Runner on ${runners[0]}`
+        : `Runners on ${runners.join(", ")}`;
       console.log(`[header:${logTag}] bases="${basesText}"`);
     } else {
       console.log(`[header:${logTag}] baserunner fields MISSING. Situation keys: ${bSit ? Object.keys(bSit).join(", ") : "no situation object found"}`);
