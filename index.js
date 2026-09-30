@@ -1399,6 +1399,36 @@ function readBody(req) {
   });
 }
 
+// Shared cache for ESPN's per-game summary endpoint (used by /plays). If two
+// people are watching the same game and polling around the same time, the
+// second request reuses the first's fresh result instead of re-fetching from
+// ESPN. Cheap insurance against duplicate load if more people ever use this.
+const espnSummaryCache = {};
+const SUMMARY_CACHE_MS = 5000;
+
+async function fetchGameSummaryCached(sport, espnId) {
+  const key = `${sport}:${espnId}`;
+  const cached = espnSummaryCache[key];
+  const now = Date.now();
+  if (cached && now - cached.fetchedAt < SUMMARY_CACHE_MS) {
+    return cached.data;
+  }
+  const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${sport}/summary?event=${espnId}`);
+  if (!r.ok) throw new Error(`ESPN ${r.status}`);
+  const data = await r.json();
+  espnSummaryCache[key] = { data, fetchedAt: now };
+  return data;
+}
+
+// Prune entries for games no one has asked about in a while, so this doesn't
+// grow forever across a long-running server (finished games, old sessions).
+setInterval(() => {
+  const now = Date.now();
+  for (const key of Object.keys(espnSummaryCache)) {
+    if (now - espnSummaryCache[key].fetchedAt > 10 * 60 * 1000) delete espnSummaryCache[key];
+  }
+}, 5 * 60 * 1000);
+
 http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   if (req.method === "OPTIONS") { jsonRes(res, 200, {}); return; }
@@ -1478,9 +1508,7 @@ http.createServer(async (req, res) => {
     if (!game) { jsonRes(res, 404, { error: "Game not found in session" }); return; }
     if (!game.espnId) { jsonRes(res, 200, { plays: [], fullName: game.fullName, note: "Game not locked yet" }); return; }
     try {
-      const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${game.sport}/summary?event=${game.espnId}`);
-      if (!r.ok) throw new Error(`ESPN ${r.status}`);
-      const data = await r.json();
+      const data = await fetchGameSummaryCached(game.sport, game.espnId);
       // ESPN's summary endpoint structures plays differently by sport — try a
       // flat "plays" array first (common for basketball/baseball/hockey/soccer),
       // fall back to football's drive-nested structure if that's empty.
