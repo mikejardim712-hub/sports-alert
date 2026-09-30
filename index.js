@@ -212,7 +212,36 @@ async function spotifyAction(ntfyTopic, action, method = "PUT") {
         console.log(`[spotify:${ntfyTopic}] ${action} retry — status ${retry.status}`);
       }
     } else if (r.status === 404) {
-      console.log(`[spotify:${ntfyTopic}] No active device for ${action} — user may not have Spotify open`);
+      if (action === "play") {
+        // No active device — Spotify app may be open but idle. Look for an
+        // available (inactive) device and explicitly start playback there.
+        console.log(`[spotify:${ntfyTopic}] No active device for play — checking for an available device`);
+        try {
+          const devicesR = await fetch("https://api.spotify.com/v1/me/player/devices", {
+            headers: { "Authorization": `Bearer ${token}` }
+          });
+          const devicesData = await devicesR.json();
+          const devices = devicesData.devices || [];
+          const device = devices.find(d => !d.is_restricted) || devices[0];
+          if (device) {
+            const retry = await fetch("https://api.spotify.com/v1/me/player/play", {
+              method: "PUT",
+              headers: {
+                "Authorization": `Bearer ${token}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({ device_id: device.id })
+            });
+            console.log(`[spotify:${ntfyTopic}] play retry on device "${device.name}" — status ${retry.status}`);
+          } else {
+            console.log(`[spotify:${ntfyTopic}] No available devices found at all — Spotify app is likely fully closed`);
+          }
+        } catch (e) {
+          console.error(`[spotify:${ntfyTopic}] device lookup error:`, e.message);
+        }
+      } else {
+        console.log(`[spotify:${ntfyTopic}] No active device for ${action} — user may not have Spotify open`);
+      }
     } else if (r.status === 403) {
       console.log(`[spotify:${ntfyTopic}] ${action} forbidden — may need premium`);
     } else {
@@ -879,7 +908,14 @@ function processGame(session, game) {
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
     } else if (clockMoved || periodJumped) {
-      if (state.onCommercial) {
+      // A clock or period change alone doesn't prove play resumed — hitting
+      // 0:00 to END a period, or the period ticking over WHILE still in a
+      // break state, is itself a break signal, not a return from one. Only
+      // treat this as "back live" if the new state isn't a break signal.
+      if (isBreakSignal && !state.onCommercial) {
+        state.onCommercial = true;
+        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (clock/period change into break)`);
+      } else if (!isBreakSignal && state.onCommercial) {
         notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
 
         state.onCommercial = false;
