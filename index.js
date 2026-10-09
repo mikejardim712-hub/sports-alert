@@ -24,9 +24,9 @@ const FINAL_GRACE_POLLS = 3;
 // without resolving, it's treated as a real break and eventually notifies.
 const NHL_TIMEOUT_ESCALATE_MS = 90000;
 const MID_INNING_ESCALATE_MS = 90000;
-// How long to wait after a timeout starts before checking play-by-play text
-// for confirmation — just long enough for ESPN's stats crew to log the play.
-const TIMEOUT_PLAY_CONFIRM_MS = 15000;
+// Fire "back live" exactly this long after ESPN's data flips to the new
+// half-inning, rather than the instant it changes.
+const MLB_BACK_LIVE_DELAY_MS = 25000;
 
 // ============================================================
 //  PERSISTENT TOKEN STORE
@@ -678,16 +678,6 @@ function getSituation(event, sport) {
     const isEnd = detailLower.includes("end");
     const isMidInning = detailLower.includes("mid"); // top->bottom of the SAME inning
 
-    // Exploratory only — checking whether the public API exposes anything
-    // pitch-clock-related (ESPN's broadcast graphic has one, but that's a
-    // separate internal feed; unconfirmed whether this public endpoint does).
-    // Safe to remove once we've confirmed either way from real game logs.
-    if (sit) {
-      const clockLikeKeys = Object.keys(sit).filter(k => /clock|timer|pitch/i.test(k));
-      if (clockLikeKeys.length) {
-        console.log(`[pitch-clock-check] Possible match! Keys: ${clockLikeKeys.join(", ")} — values: ${clockLikeKeys.map(k => `${k}=${JSON.stringify(sit[k])}`).join(", ")}`);
-      }
-    }
     const isDelay = detailLower.includes("delay") || detailLower.includes("suspend") || detailLower.includes("postpone");
     const half = detailLower.includes("bot") ? "bottom" : "top";
     const label = isDelay ? "Game delayed" : isEnd ? `End of ${ord(inning)}` : isMidInning ? `Mid ${ord(inning)}` : `${half === "top" ? "Top" : "Bot"} ${ord(inning)}, ${outs ?? 0} outs`;
@@ -825,14 +815,13 @@ async function processGame(session, game) {
         // Full-inning break (bottom of an inning just ended) — always a real
         // break, instant.
         state.onCommercial = true;
+        state.backLivePendingSince = null;
         console.log(`[${key}] MLB: Commercial${sit.isDelay ? " (delay)" : ""}`);
-      } else if (!sit.isEnd && !sit.isMidInning && state.onCommercial) {
-        // Resuming play — whether this was a full-inning break or a mid-inning
-        // break that had escalated below — fires the same way either way.
-        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${sit.half === "top" ? "Top" : "Bottom"} of the ${ord(sit.inning)} starting.`);
-
-        state.onCommercial = false;
-        console.log(`[${key}] MLB: BACK LIVE`);
+      } else if (!sit.isEnd && !sit.isMidInning && state.onCommercial && !state.backLivePendingSince) {
+        // ESPN's data just flipped to the new half-inning — wait exactly 25s
+        // from this moment before notifying, rather than firing instantly.
+        state.backLivePendingSince = now;
+        console.log(`[${key}] MLB: "${sit.label}" — inning switched, notifying in ${MLB_BACK_LIVE_DELAY_MS / 1000}s`);
       }
       state.lastDetail = sit.detail;
       state.lastChangedAt = now;
@@ -846,6 +835,17 @@ async function processGame(session, game) {
       } else {
         console.log(`[${key}] ${sit.label} — mid-inning, ${Math.round(frozen / 1000)}s / ${MID_INNING_ESCALATE_MS / 1000}s`);
       }
+    } else if (state.backLivePendingSince) {
+      // Inning already switched — waiting out the fixed 25s delay.
+      const pendingFor = now - state.backLivePendingSince;
+      if (pendingFor >= MLB_BACK_LIVE_DELAY_MS) {
+        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${sit.half === "top" ? "Top" : "Bottom"} of the ${ord(sit.inning)}, ${sit.outs ?? 0} outs.`);
+        state.onCommercial = false;
+        state.backLivePendingSince = null;
+        console.log(`[${key}] MLB: BACK LIVE (${Math.round(pendingFor / 1000)}s after inning switch)`);
+      } else {
+        console.log(`[${key}] ${sit.label} — notifying in ${Math.round((MLB_BACK_LIVE_DELAY_MS - pendingFor) / 1000)}s`);
+      }
     } else {
       console.log(`[${key}] ${sit.label} — ${state.onCommercial ? "commercial" : "live"}`);
     }
@@ -856,7 +856,7 @@ async function processGame(session, game) {
     // Basketball timeouts are short (20-75s) so a slower threshold avoids false
     // positives on quick stoppages. Football stoppages long enough to freeze the
     // clock (40s+) are almost always a real commercial break, so we can react faster.
-    const threshold = (sit.sport === "nba" || sit.sport === "ncaab") ? 110000 : 80000;
+    const threshold = (sit.sport === "nba" || sit.sport === "ncaab") ? 110000 : 90000;
     const now = Date.now();
     // Only halftime/end-of-period count as an INSTANT real break — a plain
     // timeout might be quick and never actually cut to commercial, so it only
@@ -923,7 +923,6 @@ async function processGame(session, game) {
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
-      state.timeoutConfirmedAt = null;
     } else if (clockMoved || periodJumped) {
       // A clock or period change alone doesn't prove play resumed — hitting
       // 0:00 to END a period, or the period ticking over WHILE still in a
@@ -941,7 +940,6 @@ async function processGame(session, game) {
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
-      state.timeoutConfirmedAt = null;
       console.log(`[${key}] ${sit.label}`);
     } else {
       const frozen = now - state.lastChangedAt;
@@ -961,35 +959,18 @@ async function processGame(session, game) {
         // toward the break threshold, no matter how long it runs.
         state.lastChangedAt = now;
         console.log(`[${key}] ${sit.label} — excluded from break threshold (under review)`);
-      } else if (sit.isTimeout && !state.onCommercial) {
-        // Play-by-play is the authoritative source — check it directly rather
-        // than gating on the unrelated status-frozen clock first.
-        const confirmed = await latestPlayMentions(pbpSport, game.espnId, "timeout");
-        if (confirmed) {
-          if (!state.timeoutConfirmedAt) {
-            // First poll where play-by-play shows it — start the 10s count
-            // from right now, not from whenever the clock originally froze.
-            state.timeoutConfirmedAt = now;
-            console.log(`[${key}] ${sit.sport.toUpperCase()}: Timeout confirmed via play-by-play — declaring break in ${TIMEOUT_PLAY_CONFIRM_MS / 1000}s`);
-          } else if (now - state.timeoutConfirmedAt >= TIMEOUT_PLAY_CONFIRM_MS) {
-            state.onCommercial = true;
-            console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (confirmed via play-by-play timeout, ${Math.round((now - state.timeoutConfirmedAt) / 1000)}s)`);
-          } else {
-            console.log(`[${key}] ${sit.label} — play-by-play confirmed, ${Math.round((now - state.timeoutConfirmedAt) / 1000)}s / ${TIMEOUT_PLAY_CONFIRM_MS / 1000}s`);
-          }
-        } else if (frozen >= threshold) {
-          // Play-by-play hasn't caught up yet, but the clock's been frozen
-          // long enough on its own — fall back to the old safety net.
-          state.onCommercial = true;
-          console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (frozen ${Math.round(frozen / 1000)}s, play-by-play not yet confirming)`);
-        } else {
-          console.log(`[${key}] ${sit.label} frozen ${Math.round(frozen / 1000)}s / ${threshold / 1000}s (play-by-play not yet confirming)`);
-        }
-      } else if (frozen >= threshold && !state.onCommercial) {
-        // Non-timeout stoppage (e.g. an injury pause) dragging on this long —
-        // treated as a real break, same as before.
+      } else if (!state.onCommercial && await latestPlayMentions(pbpSport, game.espnId, "timeout")) {
+        // Play-by-play explicitly logged a timeout — a real confirmed event
+        // from ESPN's stats crew, not an inference. Trust it the moment we
+        // see it, no waiting or confirmation delay.
         state.onCommercial = true;
-        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (frozen ${Math.round(frozen / 1000)}s)`);
+        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (confirmed via play-by-play timeout)`);
+      } else if (frozen >= threshold && !state.onCommercial) {
+        // Ultimate safety net — only reached if play-by-play never confirmed
+        // a timeout (network hiccup, parsing issue, etc.) but the clock has
+        // stayed frozen long enough that something's clearly happening.
+        state.onCommercial = true;
+        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (frozen ${Math.round(frozen / 1000)}s, play-by-play never confirmed)`);
       } else {
         console.log(`[${key}] ${sit.label} frozen ${Math.round(frozen / 1000)}s / ${threshold / 1000}s`);
       }
@@ -1029,7 +1010,6 @@ async function processGame(session, game) {
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
-      state.timeoutConfirmedAt = null;
       console.log(`[${key}] NHL: Intermission (instant)`);
     } else if (periodChanged || clockMoved) {
       if (state.onCommercial) {
@@ -1044,7 +1024,6 @@ async function processGame(session, game) {
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
-      state.timeoutConfirmedAt = null;
       console.log(`[${key}] ${sit.label} (detail: "${sit.detail}")`);
     } else {
       const frozen = now - state.lastChangedAt;
@@ -1052,26 +1031,14 @@ async function processGame(session, game) {
         // Reviews rarely go to commercial — never let this count toward a break
         state.lastChangedAt = now;
         console.log(`[${key}] ${sit.label} — excluded from break threshold (under review)`);
-      } else if (isExplicitTimeout && !state.onCommercial) {
-        const confirmed = await latestPlayMentions("hockey/nhl", game.espnId, "timeout");
-        if (confirmed) {
-          if (!state.timeoutConfirmedAt) {
-            state.timeoutConfirmedAt = now;
-            console.log(`[${key}] NHL: Timeout confirmed via play-by-play — declaring break in ${TIMEOUT_PLAY_CONFIRM_MS / 1000}s`);
-          } else if (now - state.timeoutConfirmedAt >= TIMEOUT_PLAY_CONFIRM_MS) {
-            state.onCommercial = true;
-            console.log(`[${key}] NHL: Commercial (confirmed via play-by-play timeout, ${Math.round((now - state.timeoutConfirmedAt) / 1000)}s)`);
-          } else {
-            console.log(`[${key}] ${sit.label} — play-by-play confirmed, ${Math.round((now - state.timeoutConfirmedAt) / 1000)}s / ${TIMEOUT_PLAY_CONFIRM_MS / 1000}s`);
-          }
-        } else if (frozen >= NHL_TIMEOUT_ESCALATE_MS) {
-          // Play-by-play hasn't caught up yet, but the clock's been frozen
-          // long enough on its own — fall back to the old safety net.
-          state.onCommercial = true;
-          console.log(`[${key}] NHL: Commercial (frozen ${Math.round(frozen / 1000)}s, play-by-play not yet confirming)`);
-        } else {
-          console.log(`[${key}] ${sit.label} frozen ${Math.round(frozen / 1000)}s / ${NHL_TIMEOUT_ESCALATE_MS / 1000}s (play-by-play not yet confirming)`);
-        }
+      } else if (!state.onCommercial && await latestPlayMentions("hockey/nhl", game.espnId, "timeout")) {
+        // Play-by-play explicitly logged a timeout — trust it instantly.
+        state.onCommercial = true;
+        console.log(`[${key}] NHL: Commercial (confirmed via play-by-play timeout)`);
+      } else if (isExplicitTimeout && !state.onCommercial && frozen >= NHL_TIMEOUT_ESCALATE_MS) {
+        // Ultimate safety net if play-by-play never confirmed it.
+        state.onCommercial = true;
+        console.log(`[${key}] NHL: Commercial (frozen ${Math.round(frozen / 1000)}s, play-by-play never confirmed)`);
       } else {
         console.log(`[${key}] ${sit.label} (detail: "${sit.detail}") — no trigger`);
       }
