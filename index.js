@@ -891,6 +891,7 @@ async function processGame(session, game) {
       notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
 
       state.onCommercial = false;
+      state.playAtBreakStart = null;
       state.lastScore = sit.score;
       state.lastDetail = sit.detail;
       state.lastClock = sit.clock;
@@ -900,6 +901,50 @@ async function processGame(session, game) {
       return;
     }
     if (isBasketball) state.lastScore = sit.score;
+
+    const pbpSport = sit.sport === "ncaab" ? "basketball/mens-college-basketball"
+      : sit.sport === "nba" ? "basketball/nba"
+      : sit.sport === "ncaaf" ? "football/college-football" : "football/nfl";
+
+    // Play-by-play is ground truth for "has play resumed" — clock/status text
+    // isn't, since some real plays (a touchback, a kneel-down, a spike) never
+    // move the game clock at all. If we're on a break, check whether a new
+    // play has been logged since the break started; if so, that's undeniable
+    // proof the ball is live, independent of what the clock shows.
+    if (state.onCommercial) {
+      const latestPlay = await getLatestPlayIdentity(pbpSport, game.espnId);
+      if (latestPlay) {
+        if (!state.playAtBreakStart) {
+          state.playAtBreakStart = latestPlay;
+          console.log(`[${key}] ${sit.sport.toUpperCase()}: Tracking play-by-play during break`);
+        } else if (latestPlay !== state.playAtBreakStart) {
+          notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
+
+          state.onCommercial = false;
+          state.playAtBreakStart = null;
+          state.lastDetail = sit.detail;
+          state.lastClock = sit.clock;
+          state.lastPeriod = sit.period;
+          state.lastChangedAt = now;
+          console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE (confirmed via new play-by-play entry)`);
+          return;
+        }
+      }
+    } else if (await latestPlayMentions(pbpSport, game.espnId, "timeout")) {
+      // Any timeout — full, team, media/TV, 20-second, whatever the exact
+      // wording — is a real logged event the instant play-by-play shows it.
+      // Checked every poll, unconditional of whether the clock or status
+      // text happened to change this round, so there's no gap where a
+      // same-poll status-text change could cause us to skip checking.
+      state.onCommercial = true;
+      state.lastDetail = sit.detail;
+      state.lastClock = sit.clock;
+      state.lastPeriod = sit.period;
+      state.lastChangedAt = now;
+      console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (confirmed via play-by-play timeout)`);
+      return;
+    }
+
     const periodJumped = sit.period !== state.lastPeriod;
     const clockMoved = sit.clock !== state.lastClock;
     const detailChanged = sit.detail !== state.lastDetail;
@@ -917,6 +962,7 @@ async function processGame(session, game) {
         notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
 
         state.onCommercial = false;
+        state.playAtBreakStart = null;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE (instant)`);
       }
       state.lastDetail = sit.detail;
@@ -935,6 +981,7 @@ async function processGame(session, game) {
         notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
 
         state.onCommercial = false;
+        state.playAtBreakStart = null;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE`);
       }
       state.lastClock = sit.clock;
@@ -943,9 +990,6 @@ async function processGame(session, game) {
       console.log(`[${key}] ${sit.label}`);
     } else {
       const frozen = now - state.lastChangedAt;
-      const pbpSport = sit.sport === "ncaab" ? "basketball/mens-college-basketball"
-        : sit.sport === "nba" ? "basketball/nba"
-        : sit.sport === "ncaaf" ? "football/college-football" : "football/nfl";
       if (sit.clock === "0:00" && !state.onCommercial && await latestPlayMentions(pbpSport, game.espnId, "end of")) {
         // Clock sitting at 0:00 and play-by-play already shows the period
         // ended — unlike a timeout, this is never a false alarm, so trust it
@@ -959,12 +1003,6 @@ async function processGame(session, game) {
         // toward the break threshold, no matter how long it runs.
         state.lastChangedAt = now;
         console.log(`[${key}] ${sit.label} — excluded from break threshold (under review)`);
-      } else if (!state.onCommercial && await latestPlayMentions(pbpSport, game.espnId, "timeout")) {
-        // Play-by-play explicitly logged a timeout — a real confirmed event
-        // from ESPN's stats crew, not an inference. Trust it the moment we
-        // see it, no waiting or confirmation delay.
-        state.onCommercial = true;
-        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (confirmed via play-by-play timeout)`);
       } else if (frozen >= threshold && !state.onCommercial) {
         // Ultimate safety net — only reached if play-by-play never confirmed
         // a timeout (network hiccup, parsing issue, etc.) but the clock has
@@ -1011,6 +1049,15 @@ async function processGame(session, game) {
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
       console.log(`[${key}] NHL: Intermission (instant)`);
+    } else if (!state.onCommercial && await latestPlayMentions("hockey/nhl", game.espnId, "timeout")) {
+      // Any timeout, whatever the exact wording — checked every poll,
+      // unconditional of clock/period changes, so there's no gap where a
+      // same-poll status-text change could cause us to skip checking.
+      state.onCommercial = true;
+      state.lastClock = sit.clock;
+      state.lastPeriod = sit.period;
+      state.lastChangedAt = now;
+      console.log(`[${key}] NHL: Commercial (confirmed via play-by-play timeout)`);
     } else if (periodChanged || clockMoved) {
       if (state.onCommercial) {
         const msg = periodChanged
@@ -1031,10 +1078,6 @@ async function processGame(session, game) {
         // Reviews rarely go to commercial — never let this count toward a break
         state.lastChangedAt = now;
         console.log(`[${key}] ${sit.label} — excluded from break threshold (under review)`);
-      } else if (!state.onCommercial && await latestPlayMentions("hockey/nhl", game.espnId, "timeout")) {
-        // Play-by-play explicitly logged a timeout — trust it instantly.
-        state.onCommercial = true;
-        console.log(`[${key}] NHL: Commercial (confirmed via play-by-play timeout)`);
       } else if (isExplicitTimeout && !state.onCommercial && frozen >= NHL_TIMEOUT_ESCALATE_MS) {
         // Ultimate safety net if play-by-play never confirmed it.
         state.onCommercial = true;
@@ -1446,6 +1489,25 @@ const SUMMARY_CACHE_MS = 5000;
 // crew, rather than an inference from a frozen clock or status text — much
 // faster to trust than waiting out a threshold. Returns false (not true) on
 // any fetch/parse issue so a hiccup here never blocks existing fallbacks.
+// Returns a stable identifier for the single most recent play, so callers
+// can detect "a new play has happened" even when the clock and status text
+// don't change (e.g. a kickoff touchback — the game clock doesn't run on a
+// dead-ball touchback, but the play itself is still proof the ball is live).
+// Prefers ESPN's own play id when present; falls back to the play text
+// itself, which is still unique enough for this purpose. Returns null on any
+// fetch/parse issue so callers can tell "couldn't check" apart from "same play".
+async function getLatestPlayIdentity(sport, espnId) {
+  try {
+    const data = await fetchGameSummaryCached(sport, espnId);
+    const rawPlays = Array.isArray(data.plays) ? data.plays : (Array.isArray(data?.plays?.items) ? data.plays.items : []);
+    if (!rawPlays.length) return null;
+    const latest = rawPlays[rawPlays.length - 1];
+    return latest?.id || latest?.text || latest?.shortText || null;
+  } catch {
+    return null;
+  }
+}
+
 async function latestPlayMentions(sport, espnId, keyword) {
   try {
     const data = await fetchGameSummaryCached(sport, espnId);
