@@ -460,6 +460,15 @@ const NCAAF  = ["alabama","crimson tide","georgia bulldogs","buckeyes","ohio sta
 const NCAAB  = ["gonzaga","zags","villanova","nova","uconn","connecticut","xavier","musketeers","creighton","marquette","seton hall","providence","friars","st johns","red storm","butler","dayton","saint mary's","gaels","memphis","cougars","houston","shockers","wichita state","bearcats","cincinnati","merrimack","merrimack warriors"];
 const SOCCER = ["usa","united states","usmnt","mexico","canada","panama","curacao","haiti","japan","iran","south korea","korea","australia","saudi arabia","qatar","uzbekistan","jordan","iraq","morocco","senegal","egypt","algeria","tunisia","south africa","cape verde","cabo verde","ghana","ivory coast","dr congo","congo","argentina","brazil","uruguay","colombia","ecuador","paraguay","new zealand","england","france","croatia","norway","portugal","germany","netherlands","holland","switzerland","scotland","spain","austria","belgium","bosnia","sweden","turkey","turkiye","czechia"];
 
+// National-team soccer competitions to search across, since there's no single
+// ESPN feed covering every confederation's games at once. These slugs follow
+// ESPN's confirmed confederation.competition pattern (uefa.champions,
+// uefa.europa, uefa.euro are confirmed real) but these three specific ones
+// are our best guess, not independently verified — check Railway logs for
+// "[soccer-search]" lines to confirm which ones actually return real events,
+// and adjust here if any come back consistently empty.
+const SOCCER_COMPETITIONS = ["soccer/uefa.nations", "soccer/concacaf.nations", "soccer/conmebol.america"];
+
 function detectSport(n) {
   n = n.toLowerCase();
   if (n.includes("ncaaf") || NCAAF.some(t => n.includes(t))) return "football/college-football";
@@ -468,7 +477,7 @@ function detectSport(n) {
   if (NBA.some(t => n.includes(t))) return "basketball/nba";
   if (NFL.some(t => n.includes(t))) return "football/nfl";
   if (NHL.some(t => n.includes(t))) return "hockey/nhl";
-  if (SOCCER.some(t => n.includes(t))) return "soccer/fifa.world";
+  if (SOCCER.some(t => n.includes(t))) return "soccer/multi";
   return "baseball/mlb";
 }
 
@@ -717,7 +726,7 @@ function getSituation(event, sport) {
     const isReview = detailLower.includes("review") || detailLower.includes("challenge");
     return { sport: "nhl", period, clock, intermission, isReview, label: `Period ${period}, ${clock}` };
   }
-  if (sport === "soccer/fifa.world") {
+  if (sport.startsWith("soccer/")) {
     const clock = status.displayClock || "0:00";
     const period = status.period || 1;
     const isHalftime = detailLower.includes("ht") || detailLower.includes("half time") || detailLower.includes("halftime");
@@ -1204,23 +1213,48 @@ async function pollAll() {
     await Promise.all(tasks.map(async ({ id, session, game }) => {
       try {
         if (!game.sport) game.sport = detectSport(game.nickname);
-        const events = await getEventsForSport(game.sport);
 
-        if (!game.espnId) {
-          const event = findEvent(events, game.nickname);
-          if (!event) {
+        let events, event;
+        if (game.sport === "soccer/multi") {
+          // Not yet resolved to a specific competition — search each
+          // candidate in turn until one has a match, then lock onto it.
+          let found = null;
+          for (const comp of SOCCER_COMPETITIONS) {
+            const compEvents = await getEventsForSport(comp);
+            console.log(`[soccer-search] ${comp}: ${compEvents.length} events`);
+            const match = findEvent(compEvents, game.nickname);
+            if (match) { found = { comp, match }; break; }
+          }
+          if (!found) {
             game.status = "not started"; game._sit = null;
             game.searchMisses = (game.searchMisses || 0) + 1;
             if (game.searchMisses === 1 || game.searchMisses % 4 === 0) {
-              console.log(`[${game.nickname}] Still searching for a match in ${events.length} ${game.sport} events (attempt ${game.searchMisses})`);
+              console.log(`[${game.nickname}] Still searching across ${SOCCER_COMPETITIONS.length} soccer competitions (attempt ${game.searchMisses})`);
             }
             return;
           }
-          game.espnId = event.id; game.fullName = event.name; game.missingCount = 0; game.searchMisses = 0;
-          console.log(`[${id}] Locked: "${event.name}" via endpoint=${game.sport}`);
+          game.sport = found.comp;
+          game.espnId = found.match.id; game.fullName = found.match.name; game.missingCount = 0; game.searchMisses = 0;
+          console.log(`[${id}] Locked: "${found.match.name}" via endpoint=${game.sport}`);
+          events = await getEventsForSport(game.sport);
+          event = events.find(e => e.id === game.espnId);
+        } else {
+          events = await getEventsForSport(game.sport);
+          if (!game.espnId) {
+            const match = findEvent(events, game.nickname);
+            if (!match) {
+              game.status = "not started"; game._sit = null;
+              game.searchMisses = (game.searchMisses || 0) + 1;
+              if (game.searchMisses === 1 || game.searchMisses % 4 === 0) {
+                console.log(`[${game.nickname}] Still searching for a match in ${events.length} ${game.sport} events (attempt ${game.searchMisses})`);
+              }
+              return;
+            }
+            game.espnId = match.id; game.fullName = match.name; game.missingCount = 0; game.searchMisses = 0;
+            console.log(`[${id}] Locked: "${match.name}" via endpoint=${game.sport}`);
+          }
+          event = events.find(e => e.id === game.espnId);
         }
-
-        const event = events.find(e => e.id === game.espnId);
         if (!event) {
           game.missingCount = (game.missingCount || 0) + 1;
           console.log(`[${game.nickname}] Not in scoreboard (${game.missingCount}/${FINAL_GRACE_POLLS})`);
@@ -1281,7 +1315,6 @@ pollAll();
 // ============================================================
 function isInSeason(sport) {
   const m = new Date().getMonth() + 1; // 1-12
-  const y = new Date().getFullYear();
   switch (sport) {
     case "baseball/mlb": return m >= 3 && m <= 11;
     case "basketball/nba": return m >= 10 || m <= 6;
@@ -1289,7 +1322,6 @@ function isInSeason(sport) {
     case "hockey/nhl": return m >= 9 || m <= 6;
     case "football/college-football": return m >= 8 || m <= 1;
     case "basketball/mens-college-basketball": return m >= 11 || m <= 4;
-    case "soccer/fifa.world": return y === 2026 && m >= 6 && m <= 7;
     default: return true;
   }
 }
@@ -1454,8 +1486,7 @@ function periodWordForSport(sport) {
     case "football/nfl": case "football/college-football": return "Qtr";
     case "basketball/nba": return "Qtr";
     case "basketball/mens-college-basketball": return "Half";
-    case "soccer/fifa.world": return "Half";
-    default: return "Period";
+    default: return sport.startsWith("soccer/") ? "Half" : "Period";
   }
 }
 
@@ -1568,7 +1599,7 @@ http.createServer(async (req, res) => {
       "nhl": "hockey/nhl",
       "ncaaf": "football/college-football",
       "ncaab": "basketball/mens-college-basketball",
-      "soccer": "soccer/fifa.world",
+      "soccer": "soccer/multi",
     };
 
     sessions[sessionId] = {
