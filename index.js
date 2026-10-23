@@ -430,26 +430,6 @@ const TEAM_ALIASES = {
   "wichita state":"wichita state shockers","shockers":"wichita state shockers",
   "cincinnati":"cincinnati bearcats","bearcats":"cincinnati bearcats",
   "merrimack":"merrimack warriors","merrimack warriors":"merrimack warriors",
-  // Soccer / World Cup 2026 — confirmed 48 teams only
-  "usa":"united states","united states":"united states","usmnt":"united states",
-  "mexico":"mexico","canada":"canada","panama":"panama",
-  "curacao":"curacao","curaçao":"curacao","haiti":"haiti",
-  "japan":"japan","iran":"iran","south korea":"south korea","korea":"south korea",
-  "australia":"australia","saudi arabia":"saudi arabia","qatar":"qatar",
-  "uzbekistan":"uzbekistan","jordan":"jordan","iraq":"iraq",
-  "morocco":"morocco","senegal":"senegal","egypt":"egypt","algeria":"algeria",
-  "tunisia":"tunisia","south africa":"south africa","cape verde":"cabo verde",
-  "cabo verde":"cabo verde","ghana":"ghana","ivory coast":"ivory coast",
-  "dr congo":"dr congo","congo":"dr congo",
-  "argentina":"argentina","brazil":"brazil","uruguay":"uruguay",
-  "colombia":"colombia","ecuador":"ecuador","paraguay":"paraguay",
-  "new zealand":"new zealand",
-  "england":"england","france":"france","croatia":"croatia","norway":"norway",
-  "portugal":"portugal","germany":"germany","netherlands":"netherlands","holland":"netherlands",
-  "switzerland":"switzerland","scotland":"scotland","spain":"spain","austria":"austria",
-  "belgium":"belgium","bosnia":"bosnia and herzegovina","bosnia and herzegovina":"bosnia and herzegovina",
-  "sweden":"sweden","turkey":"turkey","turkiye":"turkey","czechia":"czechia",
-  "czech republic":"czechia",
 };
 
 const MLB    = ["angels","astros","athletics","blue jays","braves","brewers","cardinals","cubs","diamondbacks","dbacks","dodgers","giants","guardians","mariners","marlins","mets","nationals","orioles","padres","phillies","pirates","rangers","rays","red sox","reds","rockies","royals","tigers","twins","white sox","yankees"];
@@ -458,16 +438,6 @@ const NFL    = ["49ers","bears","bengals","bills","broncos","browns","buccaneers
 const NHL    = ["avalanche","avs","blackhawks","blue jackets","blues","bruins","canadiens","habs","canucks","capitals","caps","coyotes","devils","ducks","flames","flyers","golden knights","knights","hurricanes","canes","islanders","kraken","lightning","bolts","maple leafs","leafs","oilers","penguins","pens","predators","preds","red wings","sabres","senators","sens","sharks","stars","wild","winnipeg jets","florida panthers","new york rangers"];
 const NCAAF  = ["alabama","crimson tide","georgia bulldogs","buckeyes","ohio state","wolverines","michigan","clemson","lsu","florida state","seminoles","notre dame","fighting irish","oklahoma","sooners","longhorns","penn state","nittany lions","oregon","usc","trojans","gators","florida","vols","tennessee","auburn","razorbacks","arkansas","ole miss","rebels","gamecocks","south carolina","missouri","vanderbilt","commodores","kentucky","aggies","badgers","wisconsin","hawkeyes","iowa","cornhuskers","nebraska","illini","illinois","hoosiers","indiana","boilermakers","purdue","northwestern","rutgers","scarlet knights","maryland","terps","spartans","michigan state","oklahoma state","baylor","horned frogs","tcu","kansas state","cyclones","iowa state","mountaineers","west virginia","jayhawks","kansas","red raiders","texas tech","buffs","colorado","utes","utah","huskies","washington","sun devils","arizona state","stanford","cardinal","golden bears","cal","bruins","ucla","pitt","pittsburgh","bc eagles","boston college","blue devils","duke","tar heels","unc","wolfpack","nc state","cavaliers","virginia","hokies","virginia tech","yellow jackets","georgia tech","demon deacons","wake forest","orange","syracuse","louisville","army","navy","byu"];
 const NCAAB  = ["gonzaga","zags","villanova","nova","uconn","connecticut","xavier","musketeers","creighton","marquette","seton hall","providence","friars","st johns","red storm","butler","dayton","saint mary's","gaels","memphis","cougars","houston","shockers","wichita state","bearcats","cincinnati","merrimack","merrimack warriors"];
-const SOCCER = ["usa","united states","usmnt","mexico","canada","panama","curacao","haiti","japan","iran","south korea","korea","australia","saudi arabia","qatar","uzbekistan","jordan","iraq","morocco","senegal","egypt","algeria","tunisia","south africa","cape verde","cabo verde","ghana","ivory coast","dr congo","congo","argentina","brazil","uruguay","colombia","ecuador","paraguay","new zealand","england","france","croatia","norway","portugal","germany","netherlands","holland","switzerland","scotland","spain","austria","belgium","bosnia","sweden","turkey","turkiye","czechia"];
-
-// National-team soccer competitions to search across, since there's no single
-// ESPN feed covering every confederation's games at once. These slugs follow
-// ESPN's confirmed confederation.competition pattern (uefa.champions,
-// uefa.europa, uefa.euro are confirmed real) but these three specific ones
-// are our best guess, not independently verified — check Railway logs for
-// "[soccer-search]" lines to confirm which ones actually return real events,
-// and adjust here if any come back consistently empty.
-const SOCCER_COMPETITIONS = ["soccer/uefa.nations", "soccer/concacaf.nations", "soccer/conmebol.america"];
 
 function detectSport(n) {
   n = n.toLowerCase();
@@ -477,7 +447,6 @@ function detectSport(n) {
   if (NBA.some(t => n.includes(t))) return "basketball/nba";
   if (NFL.some(t => n.includes(t))) return "football/nfl";
   if (NHL.some(t => n.includes(t))) return "hockey/nhl";
-  if (SOCCER.some(t => n.includes(t))) return "soccer/multi";
   return "baseball/mlb";
 }
 
@@ -726,16 +695,6 @@ function getSituation(event, sport) {
     const isReview = detailLower.includes("review") || detailLower.includes("challenge");
     return { sport: "nhl", period, clock, intermission, isReview, label: `Period ${period}, ${clock}` };
   }
-  if (sport.startsWith("soccer/")) {
-    const clock = status.displayClock || "0:00";
-    const period = status.period || 1;
-    const isHalftime = detailLower.includes("ht") || detailLower.includes("half time") || detailLower.includes("halftime");
-    const isETHalftime = period > 2 && (detailLower.includes("ht") || detailLower.includes("break"));
-    const isReview = detailLower.includes("var") || detailLower.includes("review");
-    const half = period === 1 ? "1st Half" : period === 2 ? "2nd Half" : period === 3 ? "ET 1st" : "ET 2nd";
-    const label = (isHalftime || isETHalftime) ? "Halftime" : isReview ? `VAR review, ${half}` : `${half}, ${clock}`;
-    return { sport: "soccer", period, clock, isHalftime: isHalftime || isETHalftime, isReview, detail, label };
-  }
   return null;
 }
 
@@ -915,43 +874,46 @@ async function processGame(session, game) {
       : sit.sport === "nba" ? "basketball/nba"
       : sit.sport === "ncaaf" ? "football/college-football" : "football/nfl";
 
-    // Play-by-play is ground truth for "has play resumed" — clock/status text
-    // isn't, since some real plays (a touchback, a kneel-down, a spike) never
-    // move the game clock at all. If we're on a break, check whether a new
-    // play has been logged since the break started; if so, that's undeniable
-    // proof the ball is live, independent of what the clock shows.
+    // Play-by-play is ground truth here. Entering a break (timeout) just
+    // acknowledges the break silently — no notification. Exiting only fires
+    // once a genuine new play shows up, and "genuine" excludes anything that
+    // is itself another break-related entry (a second timeout call, a sub
+    // made during the stoppage) — those don't mean the ball is live.
     if (state.onCommercial) {
-      const latestPlay = await getLatestPlayIdentity(pbpSport, game.espnId);
-      if (latestPlay) {
+      const text = await getLatestPlayText(pbpSport, game.espnId);
+      if (text) {
         if (!state.playAtBreakStart) {
-          state.playAtBreakStart = latestPlay;
-          console.log(`[${key}] ${sit.sport.toUpperCase()}: Tracking play-by-play during break`);
-        } else if (latestPlay !== state.playAtBreakStart) {
-          notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
+          state.playAtBreakStart = text;
+        } else if (text !== state.playAtBreakStart) {
+          if (isBreakRelatedPlayText(text)) {
+            // Another break-related entry (e.g. a second timeout call) —
+            // update what we're comparing against, but still not live.
+            state.playAtBreakStart = text;
+          } else {
+            notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
 
-          state.onCommercial = false;
-          state.playAtBreakStart = null;
-          state.lastDetail = sit.detail;
-          state.lastClock = sit.clock;
-          state.lastPeriod = sit.period;
-          state.lastChangedAt = now;
-          console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE (confirmed via new play-by-play entry)`);
-          return;
+            state.onCommercial = false;
+            state.playAtBreakStart = null;
+            state.lastDetail = sit.detail;
+            state.lastClock = sit.clock;
+            state.lastPeriod = sit.period;
+            state.lastChangedAt = now;
+            console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE (confirmed via new play)`);
+            return;
+          }
         }
       }
-    } else if (await latestPlayMentions(pbpSport, game.espnId, "timeout")) {
-      // Any timeout — full, team, media/TV, 20-second, whatever the exact
-      // wording — is a real logged event the instant play-by-play shows it.
-      // Checked every poll, unconditional of whether the clock or status
-      // text happened to change this round, so there's no gap where a
-      // same-poll status-text change could cause us to skip checking.
-      state.onCommercial = true;
-      state.lastDetail = sit.detail;
-      state.lastClock = sit.clock;
-      state.lastPeriod = sit.period;
-      state.lastChangedAt = now;
-      console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (confirmed via play-by-play timeout)`);
-      return;
+    } else {
+      const text = await getLatestPlayText(pbpSport, game.espnId);
+      if (text && text.includes("timeout")) {
+        state.onCommercial = true;
+        state.lastDetail = sit.detail;
+        state.lastClock = sit.clock;
+        state.lastPeriod = sit.period;
+        state.lastChangedAt = now;
+        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (timeout)`);
+        return;
+      }
     }
 
     const periodJumped = sit.period !== state.lastPeriod;
@@ -999,7 +961,7 @@ async function processGame(session, game) {
       console.log(`[${key}] ${sit.label}`);
     } else {
       const frozen = now - state.lastChangedAt;
-      if (sit.clock === "0:00" && !state.onCommercial && await latestPlayMentions(pbpSport, game.espnId, "end of")) {
+      if (sit.clock === "0:00" && !state.onCommercial && (await getLatestPlayText(pbpSport, game.espnId) || "").includes("end of")) {
         // Clock sitting at 0:00 and play-by-play already shows the period
         // ended — unlike a timeout, this is never a false alarm, so trust it
         // instantly rather than waiting for the status text field to catch up.
@@ -1049,6 +1011,31 @@ async function processGame(session, game) {
     const detailLower = (sit.detail || "").toLowerCase();
     const isExplicitTimeout = detailLower.includes("timeout");
 
+    // Same play-by-play exit check as basketball/football - a genuine new
+    // play (not another break-related entry) proves the ball is live,
+    // independent of clock/period.
+    if (state.onCommercial) {
+      const text = await getLatestPlayText("hockey/nhl", game.espnId);
+      if (text) {
+        if (!state.playAtBreakStart) {
+          state.playAtBreakStart = text;
+        } else if (text !== state.playAtBreakStart) {
+          if (isBreakRelatedPlayText(text)) {
+            state.playAtBreakStart = text;
+          } else {
+            notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
+            state.onCommercial = false;
+            state.playAtBreakStart = null;
+            state.lastClock = sit.clock;
+            state.lastPeriod = sit.period;
+            state.lastChangedAt = now;
+            console.log(`[${key}] NHL: BACK LIVE (confirmed via new play)`);
+            return;
+          }
+        }
+      }
+    }
+
     // Check intermission entry FIRST, before clock-moved logic — otherwise the
     // clock hitting 0:00 (which itself counts as "the clock moved") steals this
     // poll and delays intermission detection by a full extra cycle.
@@ -1058,15 +1045,12 @@ async function processGame(session, game) {
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
       console.log(`[${key}] NHL: Intermission (instant)`);
-    } else if (!state.onCommercial && await latestPlayMentions("hockey/nhl", game.espnId, "timeout")) {
-      // Any timeout, whatever the exact wording — checked every poll,
-      // unconditional of clock/period changes, so there's no gap where a
-      // same-poll status-text change could cause us to skip checking.
+    } else if (!state.onCommercial && (await getLatestPlayText("hockey/nhl", game.espnId) || "").includes("timeout")) {
       state.onCommercial = true;
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
-      console.log(`[${key}] NHL: Commercial (confirmed via play-by-play timeout)`);
+      console.log(`[${key}] NHL: Commercial (timeout)`);
     } else if (periodChanged || clockMoved) {
       if (state.onCommercial) {
         const msg = periodChanged
@@ -1077,6 +1061,7 @@ async function processGame(session, game) {
         console.log(`[${key}] NHL: BACK LIVE`);
       }
       state.onCommercial = false;
+      state.playAtBreakStart = null;
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
@@ -1094,40 +1079,6 @@ async function processGame(session, game) {
       } else {
         console.log(`[${key}] ${sit.label} (detail: "${sit.detail}") — no trigger`);
       }
-    }
-  }
-
-  // ---- SOCCER ----
-  else if (sit.sport === "soccer") {
-    if (!state.initialized) {
-      state.initialized = true;
-      state.lastDetail = sit.detail;
-      state.lastPeriod = sit.period;
-      state.onCommercial = sit.isHalftime;
-      console.log(`[${key}] Soccer tracking — ${sit.label} halftime=${sit.isHalftime}`);
-      // Broader guess for the one-time startup Spotify sync — a VAR review
-      // already showing counts too, even though it's not treated as a real
-      // break for badge/notification purposes.
-      if (session.spotifyEnabled) applySpotifyNow(ntfyTopic, sit.isHalftime || sit.isReview);
-      return;
-    }
-    const changed = sit.detail !== state.lastDetail || sit.period !== state.lastPeriod;
-    if (changed) {
-      console.log(`[${key}] Soccer: "${state.lastDetail}" -> "${sit.detail}"`);
-      if (sit.isHalftime && !state.onCommercial) {
-        state.onCommercial = true;
-        console.log(`[${key}] Soccer: Halftime`);
-      } else if (!sit.isHalftime && state.onCommercial) {
-        const halfLabel = sit.period === 2 ? "2nd half" : sit.period >= 3 ? "extra time" : "2nd half";
-        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${halfLabel} starting!`);
-
-        state.onCommercial = false;
-        console.log(`[${key}] Soccer: BACK LIVE`);
-      }
-      state.lastDetail = sit.detail;
-      state.lastPeriod = sit.period;
-    } else {
-      console.log(`[${key}] ${sit.label} — ${state.onCommercial ? "halftime" : "live"}`);
     }
   }
 
@@ -1213,48 +1164,23 @@ async function pollAll() {
     await Promise.all(tasks.map(async ({ id, session, game }) => {
       try {
         if (!game.sport) game.sport = detectSport(game.nickname);
+        const events = await getEventsForSport(game.sport);
 
-        let events, event;
-        if (game.sport === "soccer/multi") {
-          // Not yet resolved to a specific competition — search each
-          // candidate in turn until one has a match, then lock onto it.
-          let found = null;
-          for (const comp of SOCCER_COMPETITIONS) {
-            const compEvents = await getEventsForSport(comp);
-            console.log(`[soccer-search] ${comp}: ${compEvents.length} events`);
-            const match = findEvent(compEvents, game.nickname);
-            if (match) { found = { comp, match }; break; }
-          }
-          if (!found) {
+        if (!game.espnId) {
+          const event = findEvent(events, game.nickname);
+          if (!event) {
             game.status = "not started"; game._sit = null;
             game.searchMisses = (game.searchMisses || 0) + 1;
             if (game.searchMisses === 1 || game.searchMisses % 4 === 0) {
-              console.log(`[${game.nickname}] Still searching across ${SOCCER_COMPETITIONS.length} soccer competitions (attempt ${game.searchMisses})`);
+              console.log(`[${game.nickname}] Still searching for a match in ${events.length} ${game.sport} events (attempt ${game.searchMisses})`);
             }
             return;
           }
-          game.sport = found.comp;
-          game.espnId = found.match.id; game.fullName = found.match.name; game.missingCount = 0; game.searchMisses = 0;
-          console.log(`[${id}] Locked: "${found.match.name}" via endpoint=${game.sport}`);
-          events = await getEventsForSport(game.sport);
-          event = events.find(e => e.id === game.espnId);
-        } else {
-          events = await getEventsForSport(game.sport);
-          if (!game.espnId) {
-            const match = findEvent(events, game.nickname);
-            if (!match) {
-              game.status = "not started"; game._sit = null;
-              game.searchMisses = (game.searchMisses || 0) + 1;
-              if (game.searchMisses === 1 || game.searchMisses % 4 === 0) {
-                console.log(`[${game.nickname}] Still searching for a match in ${events.length} ${game.sport} events (attempt ${game.searchMisses})`);
-              }
-              return;
-            }
-            game.espnId = match.id; game.fullName = match.name; game.missingCount = 0; game.searchMisses = 0;
-            console.log(`[${id}] Locked: "${match.name}" via endpoint=${game.sport}`);
-          }
-          event = events.find(e => e.id === game.espnId);
+          game.espnId = event.id; game.fullName = event.name; game.missingCount = 0; game.searchMisses = 0;
+          console.log(`[${id}] Locked: "${event.name}" via endpoint=${game.sport}`);
         }
+
+        const event = events.find(e => e.id === game.espnId);
         if (!event) {
           game.missingCount = (game.missingCount || 0) + 1;
           console.log(`[${game.nickname}] Not in scoreboard (${game.missingCount}/${FINAL_GRACE_POLLS})`);
@@ -1478,7 +1404,7 @@ setTimeout(() => {
 //  HTTP SERVER
 // ============================================================
 // Sport-appropriate word for a play's period — baseball uses innings, hockey
-// uses periods, football/NBA use quarters, college basketball/soccer use halves.
+// uses periods, football/NBA use quarters, college basketball uses halves.
 function periodWordForSport(sport) {
   switch (sport) {
     case "baseball/mlb": return "Inning";
@@ -1486,7 +1412,7 @@ function periodWordForSport(sport) {
     case "football/nfl": case "football/college-football": return "Qtr";
     case "basketball/nba": return "Qtr";
     case "basketball/mens-college-basketball": return "Half";
-    default: return sport.startsWith("soccer/") ? "Half" : "Period";
+    default: return "Period";
   }
 }
 
@@ -1524,32 +1450,29 @@ const SUMMARY_CACHE_MS = 5000;
 // can detect "a new play has happened" even when the clock and status text
 // don't change (e.g. a kickoff touchback — the game clock doesn't run on a
 // dead-ball touchback, but the play itself is still proof the ball is live).
-// Prefers ESPN's own play id when present; falls back to the play text
-// itself, which is still unique enough for this purpose. Returns null on any
-// fetch/parse issue so callers can tell "couldn't check" apart from "same play".
-async function getLatestPlayIdentity(sport, espnId) {
+// Returns the lowercased text so callers can both compare identity AND check
+// content (needed to tell a real play apart from an incidental break-related
+// entry — a second timeout call, a substitution — that happens while the
+// game is still dead). Returns null on any fetch/parse issue.
+async function getLatestPlayText(sport, espnId) {
   try {
     const data = await fetchGameSummaryCached(sport, espnId);
     const rawPlays = Array.isArray(data.plays) ? data.plays : (Array.isArray(data?.plays?.items) ? data.plays.items : []);
     if (!rawPlays.length) return null;
     const latest = rawPlays[rawPlays.length - 1];
-    return latest?.id || latest?.text || latest?.shortText || null;
+    return (latest?.text || latest?.shortText || null)?.toLowerCase() || null;
   } catch {
     return null;
   }
 }
 
-async function latestPlayMentions(sport, espnId, keyword) {
-  try {
-    const data = await fetchGameSummaryCached(sport, espnId);
-    const rawPlays = Array.isArray(data.plays) ? data.plays : (Array.isArray(data?.plays?.items) ? data.plays.items : []);
-    if (!rawPlays.length) return false;
-    const latest = rawPlays[rawPlays.length - 1];
-    const text = (latest?.text || latest?.shortText || "").toLowerCase();
-    return text.includes(keyword);
-  } catch {
-    return false;
-  }
+// A play-by-play entry that itself describes a break (a timeout call, a
+// period ending) isn't proof the ball is live, even if it's a "new" entry
+// since the break started — it's just another break-related event, not a
+// resuming play (e.g. a TV timeout logged separately right after a team
+// timeout, or a substitution made during a stoppage).
+function isBreakRelatedPlayText(text) {
+  return text.includes("timeout") || text.includes("end of");
 }
 
 async function fetchGameSummaryCached(sport, espnId) {
@@ -1599,7 +1522,6 @@ http.createServer(async (req, res) => {
       "nhl": "hockey/nhl",
       "ncaaf": "football/college-football",
       "ncaab": "basketball/mens-college-basketball",
-      "soccer": "soccer/multi",
     };
 
     sessions[sessionId] = {
