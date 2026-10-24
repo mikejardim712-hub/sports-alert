@@ -22,11 +22,90 @@ const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const FINAL_GRACE_POLLS = 3;
 // A quick timeout/mid-inning break stays a silent badge; if it runs this long
 // without resolving, it's treated as a real break and eventually notifies.
-const NHL_TIMEOUT_ESCALATE_MS = 90000;
+// These are now all used purely as fallback safety nets — play-by-play-based
+// detection (checked elsewhere) catches the vast majority of breaks instantly
+// or near-instantly; these only matter when that data isn't available.
 const MID_INNING_ESCALATE_MS = 90000;
-// Fire "back live" exactly this long after ESPN's data flips to the new
-// half-inning, rather than the instant it changes.
-const MLB_BACK_LIVE_DELAY_MS = 25000;
+
+// Real-world break lengths, by sport, backed by actual published rules or
+// measured data rather than guesses:
+//
+// MLB — published pace-of-play rules. Timer starts at the 3rd out (same
+// moment our code detects), and the rules explicitly forbid the first pitch
+// more than 5s before the timer ends, specifically to guarantee the
+// broadcast is back from commercial by then.
+//   local 2:15, national 2:40, playoff 3:10
+//
+// NHL — "TV timeouts" are a distinct, rule-governed break (not the rare
+// 30-60s team timeout): ~2 minutes, triggered at the first stoppage after
+// the 14:00/10:00/6:00 marks each period, never after a goal/icing/power
+// play. No evidence found of a playoff-specific difference.
+//   120s, regular season and playoff alike
+//
+// NBA — full timeout is 75-100s on the court, but actual measured data (a
+// real regression analysis of game-length data, not just the on-paper
+// timeout rule) shows the real broadcast impact is closer to 2:06 in the
+// regular season and about 30s longer in the playoffs.
+//   regular 126s, playoff 156s
+//
+// NCAAB — a genuinely different structure from the NBA, not a smaller
+// version of it: scheduled "media timeouts" at the first dead ball under
+// 16/12/8/4 minutes of each half, independent of whether either team called
+// a timeout. Multiple sources document these at 60-75s in the regular
+// season — meaningfully shorter than the NBA's real figure above. The NCAA
+// tournament extends coverage (the first timeout in BOTH halves becomes a
+// full media timeout, not just the second half, per NCAA tournament rules)
+// and is widely documented by frustrated viewers as running noticeably
+// longer — no single exact tournament figure found, so this is a reasonable
+// estimate of that documented lengthening rather than as precisely sourced
+// as the 75s regular-season number.
+//
+// NFL — ad inventory agreements cap breaks at 2:20; no strong evidence of a
+// playoff-specific difference (one source says length doesn't change
+// significantly, another says playoff breaks are "sometimes" longer).
+//   140s, regular season and playoff alike
+//
+// NCAAF — college TV timeouts run distinctly longer than the NFL's capped
+// structure (no equivalent 2-minute-20 cap, described as "ruining games 3
+// minutes at a time"). Kept separate from NFL rather than sharing one value.
+//   180s
+const BREAK_LENGTHS_MS = {
+  mlb: { local: 135000, national: 160000, playoff: 190000 },
+  nhl: { regular: 120000, playoff: 120000 },
+  nba: { regular: 126000, playoff: 156000 },
+  ncaab: { regular: 75000, playoff: 110000 },
+  nfl: { regular: 140000, playoff: 140000 },
+  ncaaf: { regular: 180000, playoff: 180000 },
+};
+
+// Networks that broadcast nationally — anything else found in ESPN's
+// broadcast data is treated as a local/regional feed. Only matters for MLB,
+// where local-vs-national is the real factor (the other sports' thresholds
+// above depend on season type, not broadcast reach).
+const NATIONAL_NETWORKS = ["ESPN", "ESPN2", "FOX", "FS1", "TBS", "ABC", "NBC", "CBS", "MLB Network", "NBA TV", "NFL Network", "Apple TV+", "Roku", "Peacock", "Amazon"];
+
+function isNationalBroadcast(event) {
+  const broadcasts = event?.competitions?.[0]?.broadcasts || [];
+  const names = broadcasts.flatMap(b => b.names || []);
+  return names.some(n => NATIONAL_NETWORKS.some(nat => n.toUpperCase().includes(nat.toUpperCase())));
+}
+
+function isPostseason(event) {
+  return event?.season?.type === 3; // ESPN: 1=pre, 2=regular, 3=postseason
+}
+
+function mlbBreakLengthMs(event) {
+  if (isPostseason(event)) return BREAK_LENGTHS_MS.mlb.playoff;
+  return isNationalBroadcast(event) ? BREAK_LENGTHS_MS.mlb.national : BREAK_LENGTHS_MS.mlb.local;
+}
+
+// For NBA/NCAAB/NFL/NCAAF/NHL — only season type matters per the research
+// above, not broadcast reach, so this is simpler than the MLB version.
+function breakLengthMs(sportKey, event) {
+  const lengths = BREAK_LENGTHS_MS[sportKey];
+  if (!lengths) return 120000;
+  return isPostseason(event) ? lengths.playoff : lengths.regular;
+}
 
 // ============================================================
 //  PERSISTENT TOKEN STORE
@@ -509,6 +588,102 @@ function findEvent(events, nickname) {
   return null;
 }
 
+// MLB's own official Stats API (statsapi.mlb.com) updates after every single
+// pitch — far more granular than ESPN's inning-level status. Used here as a
+// faster confirmation signal layered on top of the broadcast-aware delay
+// above: if MLB's own feed shows a pitch has actually been thrown, we don't
+// need to wait out the rest of the delay. Every call here is wrapped so any
+// failure (API down, shape changed, team not found) just means we fall back
+// to the delay timer — this never blocks or breaks existing MLB tracking.
+const mlbGamePkCache = {}; // nickname -> { gamePk, fetchedAt }
+const MLB_GAMEPK_CACHE_MS = 6 * 60 * 60 * 1000; // a day's games don't change
+
+async function findMlbGamePk(nickname) {
+  const cached = mlbGamePkCache[nickname];
+  if (cached && Date.now() - cached.fetchedAt < MLB_GAMEPK_CACHE_MS) return cached.gamePk;
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const r = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${today}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const games = (data.dates || []).flatMap(d => d.games || []);
+    const nick = nickname.toLowerCase().replace(/ game$/, "").trim();
+    const full = TEAM_ALIASES[nick] || nick;
+    const match = games.find(g => {
+      const home = (g.teams?.home?.team?.name || "").toLowerCase();
+      const away = (g.teams?.away?.team?.name || "").toLowerCase();
+      return home.includes(full) || away.includes(full) || full.includes(home.split(" ").pop()) || full.includes(away.split(" ").pop());
+    });
+    if (!match) return null;
+    mlbGamePkCache[nickname] = { gamePk: match.gamePk, fetchedAt: Date.now() };
+    return match.gamePk;
+  } catch {
+    return null;
+  }
+}
+
+// Returns an identity string for the current at-bat's pitch activity. If this
+// changes between checks, a real pitch was thrown — the most precise "has
+// play resumed" signal available for MLB.
+async function getMlbPitchActivity(gamePk) {
+  try {
+    const r = await fetch(`https://statsapi.mlb.com/api/v1.1/game/${gamePk}/feed/live`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const current = data?.liveData?.plays?.currentPlay;
+    if (!current) return null;
+    return `${current.about?.atBatIndex ?? "?"}:${current.playEvents?.length ?? 0}`;
+  } catch {
+    return null;
+  }
+}
+
+// NHL's own official API (api-web.nhle.com) — used here purely as a parallel,
+// redundant signal alongside ESPN's play-by-play, not a replacement. NHL's
+// existing detection already works via ESPN + clock movement; this just adds
+// a second independent source that might occasionally confirm a new play a
+// poll cycle earlier. Same fail-safe design — any error just means this
+// check contributes nothing that poll, never blocks anything.
+const nhlGameIdCache = {};
+const NHL_GAMEID_CACHE_MS = 6 * 60 * 60 * 1000;
+
+async function findNhlGameId(nickname) {
+  const cached = nhlGameIdCache[nickname];
+  if (cached && Date.now() - cached.fetchedAt < NHL_GAMEID_CACHE_MS) return cached.gameId;
+  try {
+    const r = await fetch(`https://api-web.nhle.com/v1/score/now`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const games = data.games || [];
+    const nick = nickname.toLowerCase().replace(/ game$/, "").trim();
+    const full = TEAM_ALIASES[nick] || nick;
+    const match = games.find(g => {
+      const home = (g.homeTeam?.name?.default || "").toLowerCase();
+      const away = (g.awayTeam?.name?.default || "").toLowerCase();
+      return home.includes(full) || away.includes(full) || full.includes(home.split(" ").pop()) || full.includes(away.split(" ").pop());
+    });
+    if (!match) return null;
+    nhlGameIdCache[nickname] = { gameId: match.id, fetchedAt: Date.now() };
+    return match.id;
+  } catch {
+    return null;
+  }
+}
+
+async function getNhlLatestPlayText(gameId) {
+  try {
+    const r = await fetch(`https://api-web.nhle.com/v1/gamecenter/${gameId}/play-by-play`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const plays = data.plays || [];
+    if (!plays.length) return null;
+    const latest = plays[plays.length - 1];
+    return (latest?.typeDescKey || "").toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
 function ord(n) {
   return n === 1 ? "1st" : n === 2 ? "2nd" : n === 3 ? "3rd" : `${n}th`;
 }
@@ -669,13 +844,29 @@ function getSituation(event, sport) {
     const isEndOfPeriod = detailLower.includes("end") || clock === "0:00";
     const isTimeout = detailLower.includes("timeout");
     const isReview = detailLower.includes("review") || detailLower.includes("challenge");
+    // NCAAB-only: media timeouts are scheduled at the first dead ball UNDER
+    // 16/12/8/4 minutes of each half — not a maybe, like an NBA timeout, but
+    // a guaranteed real break by rule. "Under" means any time after crossing
+    // that threshold (until the next one), not just near the exact mark —
+    // e.g. a stoppage at 15:40 still counts for the 16:00 marker, it's just
+    // whenever the first whistle happens to land after the clock crosses it.
+    const isNcaabMediaTimeoutMark = sportKey === "ncaab" && isTimeout && (() => {
+      const m = clock.match(/^(\d+):(\d+)$/);
+      if (!m) return false;
+      const totalSec = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+      const marks = [16, 12, 8, 4].map(x => x * 60); // [960, 720, 480, 240]
+      return marks.some((mark, i) => {
+        const nextLower = marks[i + 1] ?? 0; // 4:00's zone runs down to 0:00
+        return totalSec <= mark && totalSec > nextLower;
+      });
+    })();
     const label = isHalftime ? "Halftime" : isEndOfPeriod ? `End of ${ord(period)}` : isTimeout ? `Timeout, ${ord(period)} ${sportKey === "ncaab" ? "half" : "qtr"}` : isReview ? `Under review, ${ord(period)} ${sportKey === "ncaab" ? "half" : "qtr"}` : `${ord(period)} ${sportKey === "ncaab" ? "half" : "qtr"}, ${clock}`;
     // Score is used as a fallback "definitely live" signal — if it changes
     // while we think the game is on break, that's undeniable proof the ball
     // was live, even if our clock/detail parsing missed the exact moment.
     const competitors = comp?.competitors || [];
     const score = competitors.length >= 2 ? competitors.map(c => c.score).join("-") : null;
-    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, isTimeout, isReview, detail, label, score };
+    return { sport: sportKey, clock, period, isHalftime, isEndOfPeriod, isTimeout, isNcaabMediaTimeoutMark, isReview, detail, label, score };
   }
   if (sport === "football/nfl" || sport === "football/college-football") {
     const clock = status.displayClock || "0:00";
@@ -786,10 +977,13 @@ async function processGame(session, game) {
         state.backLivePendingSince = null;
         console.log(`[${key}] MLB: Commercial${sit.isDelay ? " (delay)" : ""}`);
       } else if (!sit.isEnd && !sit.isMidInning && state.onCommercial && !state.backLivePendingSince) {
-        // ESPN's data just flipped to the new half-inning — wait exactly 25s
-        // from this moment before notifying, rather than firing instantly.
+        // ESPN's data just flipped to the new half-inning — wait for MLB's
+        // real published break length (local/national/playoff) before
+        // notifying, rather than an arbitrary guess.
         state.backLivePendingSince = now;
-        console.log(`[${key}] MLB: "${sit.label}" — inning switched, notifying in ${MLB_BACK_LIVE_DELAY_MS / 1000}s`);
+        state.mlbPitchBaseline = null;
+        const delay = game.mlbBreakMs || MLB_BREAK_MS.local;
+        console.log(`[${key}] MLB: "${sit.label}" — inning switched, notifying in ${Math.round(delay / 1000)}s`);
       }
       state.lastDetail = sit.detail;
       state.lastChangedAt = now;
@@ -804,15 +998,38 @@ async function processGame(session, game) {
         console.log(`[${key}] ${sit.label} — mid-inning, ${Math.round(frozen / 1000)}s / ${MID_INNING_ESCALATE_MS / 1000}s`);
       }
     } else if (state.backLivePendingSince) {
-      // Inning already switched — waiting out the fixed 25s delay.
+      // Inning already switched. Fast path: check MLB's own official feed
+      // for actual pitch activity — if a pitch has really been thrown, that's
+      // more precise than any delay estimate, so fire immediately. Falls
+      // back to waiting out the broadcast-aware delay if the MLB API can't
+      // be reached or the game can't be matched there.
+      if (!game.mlbGamePk) game.mlbGamePk = await findMlbGamePk(game.nickname);
+      if (game.mlbGamePk) {
+        const activity = await getMlbPitchActivity(game.mlbGamePk);
+        if (activity) {
+          if (!state.mlbPitchBaseline) {
+            state.mlbPitchBaseline = activity;
+          } else if (activity !== state.mlbPitchBaseline) {
+            notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${sit.half === "top" ? "Top" : "Bottom"} of the ${ord(sit.inning)}, ${sit.outs ?? 0} outs.`);
+            state.onCommercial = false;
+            state.backLivePendingSince = null;
+            state.mlbPitchBaseline = null;
+            console.log(`[${key}] MLB: BACK LIVE (confirmed via MLB Stats API pitch activity)`);
+            return;
+          }
+        }
+      }
+
       const pendingFor = now - state.backLivePendingSince;
-      if (pendingFor >= MLB_BACK_LIVE_DELAY_MS) {
+      const delay = game.mlbBreakMs || MLB_BREAK_MS.local;
+      if (pendingFor >= delay) {
         notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${sit.half === "top" ? "Top" : "Bottom"} of the ${ord(sit.inning)}, ${sit.outs ?? 0} outs.`);
         state.onCommercial = false;
         state.backLivePendingSince = null;
-        console.log(`[${key}] MLB: BACK LIVE (${Math.round(pendingFor / 1000)}s after inning switch)`);
+        state.mlbPitchBaseline = null;
+        console.log(`[${key}] MLB: BACK LIVE (${Math.round(pendingFor / 1000)}s after inning switch, fallback delay)`);
       } else {
-        console.log(`[${key}] ${sit.label} — notifying in ${Math.round((MLB_BACK_LIVE_DELAY_MS - pendingFor) / 1000)}s`);
+        console.log(`[${key}] ${sit.label} — notifying in ${Math.round((delay - pendingFor) / 1000)}s (fallback)`);
       }
     } else {
       console.log(`[${key}] ${sit.label} — ${state.onCommercial ? "commercial" : "live"}`);
@@ -821,15 +1038,18 @@ async function processGame(session, game) {
 
   // ---- NBA / NCAAB / NFL / NCAAF ----
   else if (["nba","nfl","ncaab","ncaaf"].includes(sit.sport)) {
-    // Basketball timeouts are short (20-75s) so a slower threshold avoids false
-    // positives on quick stoppages. Football stoppages long enough to freeze the
-    // clock (40s+) are almost always a real commercial break, so we can react faster.
-    const threshold = (sit.sport === "nba" || sit.sport === "ncaab") ? 110000 : 90000;
+    // Real measured/published break lengths per sport (see BREAK_LENGTHS_MS),
+    // season-aware (playoff games run longer, backed by real data for NBA).
+    // This is a fallback safety net — play-by-play detection elsewhere
+    // catches the vast majority of breaks before this ever matters.
+    const threshold = game.breakThresholdMs || 120000;
     const now = Date.now();
-    // Only halftime/end-of-period count as an INSTANT real break — a plain
-    // timeout might be quick and never actually cut to commercial, so it only
-    // becomes a real break if the clock stays frozen long enough (below).
-    const isBreakSignal = sit.isHalftime || sit.isEndOfPeriod;
+    // Halftime/end-of-period are INSTANT real breaks. A plain timeout might
+    // be quick and never actually cut to commercial, so normally it only
+    // becomes a real break if the clock stays frozen long enough (below) —
+    // except an NCAAB media timeout mark, which is a scheduled, guaranteed
+    // break by rule, not a maybe, so it's treated as instant too.
+    const isBreakSignal = sit.isHalftime || sit.isEndOfPeriod || sit.isNcaabMediaTimeoutMark;
     const isBasketball = sit.sport === "nba" || sit.sport === "ncaab";
     if (!state.initialized) {
       state.initialized = true;
@@ -1011,26 +1231,57 @@ async function processGame(session, game) {
     const detailLower = (sit.detail || "").toLowerCase();
     const isExplicitTimeout = detailLower.includes("timeout");
 
-    // Same play-by-play exit check as basketball/football - a genuine new
-    // play (not another break-related entry) proves the ball is live,
-    // independent of clock/period.
+    // Checked in priority order: NHL's own official API first (clean,
+    // structured event-type codes are inherently more reliable to parse
+    // correctly than ESPN's free-text play descriptions), then ESPN as a
+    // fallback — kept rather than removed, so a change to NHL's API shape
+    // can never silently break detection entirely.
     if (state.onCommercial) {
-      const text = await getLatestPlayText("hockey/nhl", game.espnId);
-      if (text) {
-        if (!state.playAtBreakStart) {
-          state.playAtBreakStart = text;
-        } else if (text !== state.playAtBreakStart) {
-          if (isBreakRelatedPlayText(text)) {
-            state.playAtBreakStart = text;
-          } else {
+      if (!game.nhlGameId) game.nhlGameId = await findNhlGameId(game.nickname);
+      let confirmedByNhl = false;
+      if (game.nhlGameId) {
+        const nhlText = await getNhlLatestPlayText(game.nhlGameId);
+        if (nhlText) {
+          const isBreakCode = nhlText.includes("stoppage") || nhlText.includes("timeout") || nhlText.includes("end");
+          if (!state.nhlOfficialBaseline) {
+            state.nhlOfficialBaseline = nhlText;
+          } else if (nhlText !== state.nhlOfficialBaseline && !isBreakCode) {
             notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
             state.onCommercial = false;
             state.playAtBreakStart = null;
+            state.nhlOfficialBaseline = null;
             state.lastClock = sit.clock;
             state.lastPeriod = sit.period;
             state.lastChangedAt = now;
-            console.log(`[${key}] NHL: BACK LIVE (confirmed via new play)`);
+            console.log(`[${key}] NHL: BACK LIVE (confirmed via NHL official API)`);
             return;
+          } else if (nhlText !== state.nhlOfficialBaseline) {
+            state.nhlOfficialBaseline = nhlText;
+          }
+          confirmedByNhl = true; // NHL's API is reachable and gave us a real answer this poll
+        }
+      }
+
+      // Fallback to ESPN's play-by-play only if NHL's own API couldn't be
+      // reached or matched this poll — not run redundantly every time.
+      if (!confirmedByNhl) {
+        const text = await getLatestPlayText("hockey/nhl", game.espnId);
+        if (text) {
+          if (!state.playAtBreakStart) {
+            state.playAtBreakStart = text;
+          } else if (text !== state.playAtBreakStart) {
+            if (isBreakRelatedPlayText(text)) {
+              state.playAtBreakStart = text;
+            } else {
+              notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
+              state.onCommercial = false;
+              state.playAtBreakStart = null;
+              state.lastClock = sit.clock;
+              state.lastPeriod = sit.period;
+              state.lastChangedAt = now;
+              console.log(`[${key}] NHL: BACK LIVE (confirmed via ESPN fallback)`);
+              return;
+            }
           }
         }
       }
@@ -1062,6 +1313,7 @@ async function processGame(session, game) {
       }
       state.onCommercial = false;
       state.playAtBreakStart = null;
+      state.nhlOfficialBaseline = null;
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
@@ -1072,8 +1324,10 @@ async function processGame(session, game) {
         // Reviews rarely go to commercial — never let this count toward a break
         state.lastChangedAt = now;
         console.log(`[${key}] ${sit.label} — excluded from break threshold (under review)`);
-      } else if (isExplicitTimeout && !state.onCommercial && frozen >= NHL_TIMEOUT_ESCALATE_MS) {
-        // Ultimate safety net if play-by-play never confirmed it.
+      } else if (isExplicitTimeout && !state.onCommercial && frozen >= (game.breakThresholdMs || BREAK_LENGTHS_MS.nhl.regular)) {
+        // Ultimate safety net if play-by-play never confirmed it. Real NHL TV
+        // timeouts run ~2 minutes (see BREAK_LENGTHS_MS) — distinct from the
+        // rare 30-60s team timeout, but far more common and what this is for.
         state.onCommercial = true;
         console.log(`[${key}] NHL: Commercial (frozen ${Math.round(frozen / 1000)}s, play-by-play never confirmed)`);
       } else {
@@ -1193,6 +1447,12 @@ async function pollAll() {
         }
 
         game.missingCount = 0;
+        if (game.sport === "baseball/mlb") game.mlbBreakMs = mlbBreakLengthMs(event);
+        else if (game.sport === "basketball/nba") game.breakThresholdMs = breakLengthMs("nba", event);
+        else if (game.sport === "basketball/mens-college-basketball") game.breakThresholdMs = breakLengthMs("ncaab", event);
+        else if (game.sport === "football/nfl") game.breakThresholdMs = breakLengthMs("nfl", event);
+        else if (game.sport === "football/college-football") game.breakThresholdMs = breakLengthMs("ncaaf", event);
+        else if (game.sport === "hockey/nhl") game.breakThresholdMs = breakLengthMs("nhl", event);
 
         const comp = event?.competitions?.[0];
         const status = comp?.status;
