@@ -380,6 +380,22 @@ function parseCurrentlyPlaying(data) {
   };
 }
 
+// Called at every point where onCommercial changes — including the early
+// returns in the fast-path detection logic, which otherwise skip past the
+// bottom-of-function sync block entirely, delaying the actual pause/resume
+// by up to 15s (until the next periodic consistency check) even though the
+// break itself was detected instantly.
+function syncSpotifyOnTransition(session, ntfyTopic, wasOnCommercial, isOnCommercial, key) {
+  if (!session.spotifyEnabled) return;
+  if (!wasOnCommercial && isOnCommercial) {
+    console.log(`[${key}] Spotify: resuming music (game went to break)`);
+    spotifyResume(ntfyTopic);
+  } else if (wasOnCommercial && !isOnCommercial) {
+    console.log(`[${key}] Spotify: pausing music (game came back live)`);
+    spotifyPause(ntfyTopic);
+  }
+}
+
 function applySpotifyNow(ntfyTopic, onCommercial) {
   if (onCommercial) spotifyResume(ntfyTopic);
   else spotifyPause(ntfyTopic);
@@ -1011,6 +1027,7 @@ async function processGame(session, game) {
             state.mlbPitchBaseline = activity;
           } else if (activity !== state.mlbPitchBaseline) {
             notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${sit.half === "top" ? "Top" : "Bottom"} of the ${ord(sit.inning)}, ${sit.outs ?? 0} outs.`);
+            syncSpotifyOnTransition(session, ntfyTopic, true, false, key);
             state.onCommercial = false;
             state.backLivePendingSince = null;
             state.mlbPitchBaseline = null;
@@ -1078,6 +1095,7 @@ async function processGame(session, game) {
     if (isBasketball && state.onCommercial && sit.score && state.lastScore && sit.score !== state.lastScore) {
       notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
 
+      syncSpotifyOnTransition(session, ntfyTopic, true, false, key);
       state.onCommercial = false;
       state.playAtBreakStart = null;
       state.lastScore = sit.score;
@@ -1112,6 +1130,7 @@ async function processGame(session, game) {
           } else {
             notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
 
+            syncSpotifyOnTransition(session, ntfyTopic, true, false, key);
             state.onCommercial = false;
             state.playAtBreakStart = null;
             state.lastDetail = sit.detail;
@@ -1126,6 +1145,7 @@ async function processGame(session, game) {
     } else {
       const text = await getLatestPlayText(pbpSport, game.espnId);
       if (text && text.includes("timeout")) {
+        syncSpotifyOnTransition(session, ntfyTopic, false, true, key);
         state.onCommercial = true;
         state.lastDetail = sit.detail;
         state.lastClock = sit.clock;
@@ -1247,6 +1267,7 @@ async function processGame(session, game) {
             state.nhlOfficialBaseline = nhlText;
           } else if (nhlText !== state.nhlOfficialBaseline && !isBreakCode) {
             notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
+            syncSpotifyOnTransition(session, ntfyTopic, true, false, key);
             state.onCommercial = false;
             state.playAtBreakStart = null;
             state.nhlOfficialBaseline = null;
@@ -1274,6 +1295,7 @@ async function processGame(session, game) {
               state.playAtBreakStart = text;
             } else {
               notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
+              syncSpotifyOnTransition(session, ntfyTopic, true, false, key);
               state.onCommercial = false;
               state.playAtBreakStart = null;
               state.lastClock = sit.clock;
@@ -1342,15 +1364,12 @@ async function processGame(session, game) {
   else game.status = "live";
 
   // ---- SPOTIFY transition detection ----
+  // Catches any transition that fell through to here without an early
+  // return above (the MLB broadcast-delay fallback, NCAAB media timeout
+  // markers, period-end-at-0:00, NHL intermission/timeout entry, and the
+  // frozen-threshold safety nets all still reach this point normally).
+  syncSpotifyOnTransition(session, ntfyTopic, wasOnCommercial, state.onCommercial, key);
   if (session.spotifyEnabled) {
-    if (!wasOnCommercial && state.onCommercial) {
-      console.log(`[${key}] Spotify: resuming music (game went to break)`);
-      spotifyResume(ntfyTopic);
-    } else if (wasOnCommercial && !state.onCommercial) {
-      console.log(`[${key}] Spotify: pausing music (game came back live)`);
-      spotifyPause(ntfyTopic);
-    }
-
     // Beyond reacting to transitions WE detect, periodically verify Spotify's
     // actual playback state matches what it should be right now. Catches the
     // case where you start playing music mid-game with no break/live
