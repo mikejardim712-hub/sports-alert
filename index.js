@@ -1180,20 +1180,35 @@ async function processGame(session, game) {
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
-    } else if (clockMoved || periodJumped) {
-      // A clock or period change alone doesn't prove play resumed — hitting
-      // 0:00 to END a period, or the period ticking over WHILE still in a
-      // break state, is itself a break signal, not a return from one. Only
-      // treat this as "back live" if the new state isn't a break signal.
+    } else if (periodJumped) {
+      // The period just changed — e.g. end of Q3 -> "4th quarter, 15:00".
+      // That reset clock value is an administrative fact, not proof the
+      // broadcast is back, so this can enter a break (never a false alarm)
+      // but can NEVER fire back-live on its own. Exiting still depends on
+      // either a genuine clock tick on a later poll (below) or the
+      // play-by-play "new play" check that runs every poll while on break.
       if (isBreakSignal && !state.onCommercial) {
         state.onCommercial = true;
         console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (clock/period change into break)`);
+      }
+      state.lastClock = sit.clock;
+      state.lastPeriod = sit.period;
+      state.lastChangedAt = now;
+      console.log(`[${key}] ${sit.label}`);
+    } else if (clockMoved) {
+      // Clock genuinely ticking within the SAME period — real evidence the
+      // ball is live, not just an administrative reset, so this can fire
+      // back-live directly.
+      if (isBreakSignal && !state.onCommercial) {
+        state.onCommercial = true;
+        console.log(`[${key}] ${sit.sport.toUpperCase()}: Commercial (clock change into break)`);
       } else if (!isBreakSignal && state.onCommercial) {
         notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back — ${ord(sit.period)}, ${sit.clock} left.`);
 
+        syncSpotifyOnTransition(session, ntfyTopic, true, false, key);
         state.onCommercial = false;
         state.playAtBreakStart = null;
-        console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE`);
+        console.log(`[${key}] ${sit.sport.toUpperCase()}: BACK LIVE (confirmed via clock moving)`);
       }
       state.lastClock = sit.clock;
       state.lastPeriod = sit.period;
@@ -1324,14 +1339,23 @@ async function processGame(session, game) {
       state.lastPeriod = sit.period;
       state.lastChangedAt = now;
       console.log(`[${key}] NHL: Commercial (timeout)`);
-    } else if (periodChanged || clockMoved) {
+    } else if (periodChanged) {
+      // A new period starting (e.g. after intermission) resets the clock to
+      // its starting value — that's an administrative fact, not proof the
+      // broadcast is back. Never fires back-live on its own; exiting still
+      // depends on a genuine clock tick (below) or the play-by-play checks
+      // that run every poll while on break.
+      state.lastClock = sit.clock;
+      state.lastPeriod = sit.period;
+      state.lastChangedAt = now;
+      console.log(`[${key}] ${sit.label} (detail: "${sit.detail}") — period changed, awaiting real confirmation`);
+    } else if (clockMoved) {
+      // Clock genuinely ticking within the SAME period — real evidence.
       if (state.onCommercial) {
-        const msg = periodChanged
-          ? `${game.fullName || game.nickname} is back — ${ord(sit.period)} period starting.`
-          : `${game.fullName || game.nickname} is back live — ${sit.clock} left in the ${ord(sit.period)}.`;
-        notify(ntfyTopic, "Game is back!", msg);
+        notify(ntfyTopic, "Game is back!", `${game.fullName || game.nickname} is back live — ${sit.clock} left in the ${ord(sit.period)}.`);
 
-        console.log(`[${key}] NHL: BACK LIVE`);
+        syncSpotifyOnTransition(session, ntfyTopic, true, false, key);
+        console.log(`[${key}] NHL: BACK LIVE (confirmed via clock moving)`);
       }
       state.onCommercial = false;
       state.playAtBreakStart = null;
